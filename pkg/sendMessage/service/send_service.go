@@ -2209,6 +2209,8 @@ func (s *sendService) SendMessage(instance *instance_model.Instance, msg *waE2E.
 					QuotedMessage: &waE2E.Message{Conversation: proto.String("")},
 				}
 			}
+		case "PollUpdateMessage":
+			// Voto de enquete: enviado como está (sem contextInfo/quoted/menções).
 		default:
 			return nil, fmt.Errorf("invalid messageType: %s", messageType)
 		}
@@ -2247,6 +2249,8 @@ func (s *sendService) SendMessage(instance *instance_model.Instance, msg *waE2E.
 			// ContextInfo already set in SendCarousel/SendButton/SendList
 		case "ListMessage":
 			// ContextInfo already set in SendList
+		case "PollUpdateMessage":
+			// Voto de enquete: enviado como está (sem contextInfo/quoted/menções).
 		default:
 			return nil, fmt.Errorf("invalid messageType: %s", messageType)
 		}
