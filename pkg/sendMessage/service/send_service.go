@@ -125,6 +125,7 @@ type PollStruct struct {
 	MentionAll   bool         `json:"mentionAll"`
 	FormatJid    *bool        `json:"formatJid,omitempty"`
 	Quoted       QuotedStruct `json:"quoted"`
+	EndTime      int64        `json:"endTime"` // término opcional (ms). 0 = sem término.
 }
 
 // PollVoteStruct: registra um voto numa enquete existente (envia um pollUpdateMessage).
@@ -1513,6 +1514,12 @@ func (s *sendService) sendPollWithRetry(data *PollStruct, instance *instance_mod
 		}
 
 		msg := client.BuildPollCreation(data.Question, data.Options, data.MaxAnswer)
+
+		// Término opcional da enquete (endTime): timestamp em ms. BuildPollCreation não
+		// expõe esse campo, então setamos direto na mensagem construída.
+		if data.EndTime > 0 && msg.PollCreationMessage != nil {
+			msg.PollCreationMessage.EndTime = proto.Int64(data.EndTime)
+		}
 
 		message, err := s.SendMessage(instance, msg, "PollCreationMessage", &SendDataStruct{
 			Id:           data.Id,
