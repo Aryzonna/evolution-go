@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1193,6 +1194,24 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 				for _, option := range decrypted.SelectedOptions {
 					mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("- %X", option)
 
+				}
+
+				// Option A: injeta o voto JÁ DECODIFICADO no payload publicado, para que os
+				// workers tabulem por instância (como qualquer outro evento) sem depender do
+				// endpoint compartilhado /polls/results. selectedOptions vão como hash SHA-256
+				// hex (minúsculo), casando com o hash das opções guardado no consumidor.
+				if pollKey := evt.Message.GetPollUpdateMessage().GetPollCreationMessageKey(); pollKey != nil {
+					selectedHashes := make([]string, 0, len(decrypted.SelectedOptions))
+					for _, option := range decrypted.SelectedOptions {
+						selectedHashes = append(selectedHashes, hex.EncodeToString(option))
+					}
+					dataMap["pollVote"] = map[string]interface{}{
+						"pollMessageId":   pollKey.GetID(),
+						"voterJid":        evt.Info.Sender.String(),
+						"voterAltJid":     evt.Info.SenderAlt.String(),
+						"voterName":       evt.Info.PushName,
+						"selectedOptions": selectedHashes,
+					}
 				}
 
 				// NOVO: Salvar voto no banco de dados de forma NÃO-INVASIVA
