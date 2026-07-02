@@ -39,6 +39,7 @@ type SendService interface {
 	SendMediaUrl(data *MediaStruct, instance *instance_model.Instance) (*MessageSendStruct, error)
 	SendMediaFile(data *MediaStruct, fileData []byte, instance *instance_model.Instance) (*MessageSendStruct, error)
 	SendPoll(data *PollStruct, instance *instance_model.Instance) (*MessageSendStruct, error)
+	SendPollVote(data *PollVoteStruct, instance *instance_model.Instance) (*MessageSendStruct, error)
 	SendSticker(data *StickerStruct, instance *instance_model.Instance) (*MessageSendStruct, error)
 	SendLocation(data *LocationStruct, instance *instance_model.Instance) (*MessageSendStruct, error)
 	SendContact(data *ContactStruct, instance *instance_model.Instance) (*MessageSendStruct, error)
@@ -124,6 +125,16 @@ type PollStruct struct {
 	MentionAll   bool         `json:"mentionAll"`
 	FormatJid    *bool        `json:"formatJid,omitempty"`
 	Quoted       QuotedStruct `json:"quoted"`
+}
+
+// PollVoteStruct: registra um voto numa enquete existente (envia um pollUpdateMessage).
+type PollVoteStruct struct {
+	Number          string   `json:"number"`          // chat/grupo (@g.us) onde a enquete está
+	PollMessageId   string   `json:"pollMessageId"`   // ID da mensagem de CRIAÇÃO da enquete
+	PollFromMe      bool     `json:"pollFromMe"`      // a enquete foi criada por nós?
+	PollCreatorJid  string   `json:"pollCreatorJid"`  // JID do criador (quando !pollFromMe)
+	SelectedOptions []string `json:"selectedOptions"` // NOMES das opções escolhidas ([] = limpar voto)
+	FormatJid       *bool    `json:"formatJid,omitempty"`
 }
 
 type StickerStruct struct {
@@ -1532,6 +1543,55 @@ func (s *sendService) sendPollWithRetry(data *PollStruct, instance *instance_mod
 	}
 
 	return nil, fmt.Errorf("failed to send poll after %d attempts", maxRetries)
+}
+
+// SendPollVote registra um voto numa enquete existente. Monta o pollUpdateMessage via
+// whatsmeow (BuildPollVote encripta o voto com o messageSecret da enquete guardado no
+// store) e envia ao chat. `Sender` da enquete = nosso próprio JID quando pollFromMe,
+// senão o JID do criador informado — é a chave usada pra localizar o messageSecret.
+func (s *sendService) SendPollVote(data *PollVoteStruct, instance *instance_model.Instance) (*MessageSendStruct, error) {
+	client, err := s.ensureClientConnected(instance.Id)
+	if err != nil {
+		return nil, err
+	}
+
+	chatJID, ok := utils.ParseJID(data.Number)
+	if !ok {
+		return nil, fmt.Errorf("invalid chat jid: %s", data.Number)
+	}
+
+	var senderJID types.JID
+	if data.PollFromMe {
+		if client.Store.ID == nil {
+			return nil, fmt.Errorf("client not logged in")
+		}
+		senderJID = client.Store.ID.ToNonAD()
+	} else {
+		senderJID, ok = utils.ParseJID(data.PollCreatorJid)
+		if !ok {
+			return nil, fmt.Errorf("invalid poll creator jid: %s", data.PollCreatorJid)
+		}
+	}
+
+	pollInfo := &types.MessageInfo{
+		ID: data.PollMessageId,
+		MessageSource: types.MessageSource{
+			Chat:     chatJID,
+			Sender:   senderJID,
+			IsFromMe: data.PollFromMe,
+			IsGroup:  chatJID.Server == types.GroupServer,
+		},
+	}
+
+	msg, err := client.BuildPollVote(context.Background(), pollInfo, data.SelectedOptions)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build poll vote: %w", err)
+	}
+
+	return s.SendMessage(instance, msg, "PollUpdateMessage", &SendDataStruct{
+		Number:    data.Number,
+		FormatJid: data.FormatJid,
+	})
 }
 
 func convertToWebP(imageData string) ([]byte, error) {

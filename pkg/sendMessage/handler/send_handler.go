@@ -17,6 +17,7 @@ type SendHandler interface {
 	SendLink(ctx *gin.Context)
 	SendMedia(ctx *gin.Context)
 	SendPoll(ctx *gin.Context)
+	SendPollVote(ctx *gin.Context)
 	SendSticker(ctx *gin.Context)
 	SendLocation(ctx *gin.Context)
 	SendContact(ctx *gin.Context)
@@ -326,6 +327,57 @@ func (s *sendHandler) SendPoll(ctx *gin.Context) {
 	}
 
 	message, err := s.sendMessageService.SendPoll(data, instance)
+	if err != nil {
+		ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	ctx.JSON(http.StatusOK, gin.H{"message": "success", "data": message})
+}
+
+// Register a vote on an existing poll
+// @Summary Vote on a poll
+// @Description Registra um voto numa enquete existente (envia um pollUpdateMessage)
+// @Tags Send Message
+// @Accept json
+// @Produce json
+// @Param message body send_service.PollVoteStruct true "Vote data"
+// @Success 200 {object} gin.H "success"
+// @Failure 400 {object} gin.H "Error on validation"
+// @Failure 500 {object} gin.H "Internal server error"
+// @Router /send/pollVote [post]
+func (s *sendHandler) SendPollVote(ctx *gin.Context) {
+	getInstance := ctx.MustGet("instance")
+
+	instance, ok := getInstance.(*instance_model.Instance)
+	if !ok {
+		ctx.JSON(http.StatusInternalServerError, gin.H{"error": "instance not found"})
+		return
+	}
+
+	var data *send_service.PollVoteStruct
+	err := ctx.ShouldBindBodyWithJSON(&data)
+	if err != nil {
+		ctx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	if data.Number == "" {
+		ctx.JSON(http.StatusBadRequest, gin.H{"error": "number is required"})
+		return
+	}
+
+	if data.PollMessageId == "" {
+		ctx.JSON(http.StatusBadRequest, gin.H{"error": "pollMessageId is required"})
+		return
+	}
+
+	if !data.PollFromMe && data.PollCreatorJid == "" {
+		ctx.JSON(http.StatusBadRequest, gin.H{"error": "pollCreatorJid is required when pollFromMe is false"})
+		return
+	}
+
+	message, err := s.sendMessageService.SendPollVote(data, instance)
 	if err != nil {
 		ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
