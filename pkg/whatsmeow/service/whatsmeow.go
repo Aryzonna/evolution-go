@@ -1171,6 +1171,21 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 			}
 
 			decrypted, err := mycli.clientPointer[mycli.userID].DecryptPollVote(context.Background(), evt)
+			if err != nil && evt.Info.SenderAlt.Server == types.HiddenUserServer && !evt.Info.SenderAlt.IsEmpty() {
+				// O WhatsApp criptografa o voto com a identidade @lid do votante. Após o
+				// swap de JID, evt.Info.Sender pode estar como @s.whatsapp.net (telefone),
+				// o que faz o HKDF/AAD divergir e o GCM falhar (message authentication
+				// failed). Tentamos novamente usando o @lid (SenderAlt) como remetente do
+				// voto e restauramos o Sender original para salvar com o número real.
+				origSender := evt.Info.Sender
+				evt.Info.Sender = evt.Info.SenderAlt
+				retryDecrypted, retryErr := mycli.clientPointer[mycli.userID].DecryptPollVote(context.Background(), evt)
+				evt.Info.Sender = origSender
+				if retryErr == nil {
+					mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Poll vote decrypted using @lid identity (%s)", mycli.userID, evt.Info.SenderAlt.String())
+					decrypted, err = retryDecrypted, nil
+				}
+			}
 			if err != nil {
 				mycli.loggerWrapper.GetLogger(mycli.userID).LogError("[%s] Failed to decrypt vote: %v", mycli.userID, err)
 			} else {
