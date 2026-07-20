@@ -39,8 +39,8 @@ Makefile
 # Não excluir - precisa estar na imagem final para ser acessado via /manager
 
 # Keep these important files/folders for build:
-# - go.mod, go.sum (dependências; whatsmeow vem do proxy oficial desde 0.7.2,
-#   não há mais submódulo whatsmeow-lib no contexto)
+# - whatsmeow/ (nossa versão local modificada)
+# - go.mod, go.sum (dependências)
 # - pkg/, cmd/ (código fonte necessário para compilar)
 # - docs/docs.go (gerado pelo swagger, necessário para build)
 

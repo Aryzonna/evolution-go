@@ -16,8 +16,6 @@ const (
 	NEWSLETTER    = "NEWSLETTER"
 	QRCODE        = "QRCODE"
 	BUTTON_CLICK  = "BUTTON_CLICK"
-	PICTURE       = "PICTURE"
-	USER_ABOUT    = "USER_ABOUT"
 )
 
 var AllEventTypes = []string{
@@ -35,8 +33,6 @@ var AllEventTypes = []string{
 	NEWSLETTER,
 	QRCODE,
 	BUTTON_CLICK,
-	PICTURE,
-	USER_ABOUT,
 }
 
 var validEventTypes = map[string]bool{
@@ -55,8 +51,6 @@ var validEventTypes = map[string]bool{
 	NEWSLETTER:    true,
 	QRCODE:        true,
 	BUTTON_CLICK:  true,
-	PICTURE:       true,
-	USER_ABOUT:    true,
 }
 
 func IsEventType(eventType string) bool {
