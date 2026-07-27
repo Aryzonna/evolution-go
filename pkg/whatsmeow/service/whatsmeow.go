@@ -1859,12 +1859,19 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 		doWebhook = true
 		postMap["event"] = "Archive"
 
-		dataMap := postMap["data"].(map[string]interface{})
-		dataMap["JID"] = evt.JID
-		dataMap["Timestamp"] = evt.Timestamp
-		dataMap["Action"] = evt.Action
-		dataMap["FromFullSync"] = evt.FromFullSync
-		postMap["data"] = dataMap
+		// postMap["data"] ainda é o evento CRU (*events.Archive) — ver o topo de
+		// myEventHandler. O type assertion direto para map[string]interface{} que
+		// existia aqui dava PANIC ("interface conversion: interface {} is
+		// *events.Archive, not map[string]interface {}"), e o whatsmeow apenas
+		// recupera e descarta: o evento morria antes do dispatch, sem chegar ao
+		// webhook nem à fila. Como o próprio *events.Archive já carrega exatamente
+		// estes 4 campos, monta-se o mapa direto (mesmo idioma dos demais cases).
+		postMap["data"] = map[string]interface{}{
+			"JID":          evt.JID,
+			"Timestamp":    evt.Timestamp,
+			"Action":       evt.Action,
+			"FromFullSync": evt.FromFullSync,
+		}
 
 		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Chat archived", mycli.userID)
 	case *events.HistorySync:
