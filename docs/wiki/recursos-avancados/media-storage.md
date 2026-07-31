@@ -155,25 +155,37 @@ MINIO_USE_SSL=true
 
 ### Organização
 
-Arquivos são armazenados com estrutura organizada:
+Arquivos são armazenados com estrutura organizada, **separados por instância**:
 
 ```
 bucket-name/
 └── evolution-go-medias/
-    ├── image-abc123.jpg
-    ├── video-def456.mp4
-    ├── audio-ghi789.ogg
-    └── document-jkl012.pdf
+    ├── 0c9a1f2e-5f4b-4a3c-9d0e-8b7a6c5d4e3f/   ← id da instância
+    │   ├── image-abc123.jpg
+    │   └── video-def456.mp4
+    ├── 7d1b3a55-2c6e-4f81-b0aa-1e2d3c4b5a69/
+    │   ├── audio-ghi789.ogg
+    │   └── document-jkl012.pdf
+    ├── image-legado-abc.jpg                     ← gravados antes da separação
+    └── video-legado-def.mp4
 ```
 
 ### Caminho dos Arquivos
 
-Todos os arquivos são armazenados automaticamente no diretório `evolution-go-medias/`:
+Todos os arquivos são armazenados automaticamente em
+`evolution-go-medias/{instanceId}/`, onde `instanceId` é o id da instância que recebeu a
+mensagem. Isso permite lifecycle policy, cota e limpeza por instância sem precisar cruzar
+a chave do objeto com o banco de dados.
 
-**Exemplos**:
-- Arquivo: `photo-123.jpg` → Caminho: `evolution-go-medias/photo-123.jpg`
-- Arquivo: `video-456.mp4` → Caminho: `evolution-go-medias/video-456.mp4`
-- Arquivo: `document-789.pdf` → Caminho: `evolution-go-medias/document-789.pdf`
+**Exemplos** (instância `0c9a1f2e-5f4b-4a3c-9d0e-8b7a6c5d4e3f`):
+- Arquivo: `photo-123.jpg` → Caminho: `evolution-go-medias/0c9a1f2e-5f4b-4a3c-9d0e-8b7a6c5d4e3f/photo-123.jpg`
+- Arquivo: `video-456.mp4` → Caminho: `evolution-go-medias/0c9a1f2e-5f4b-4a3c-9d0e-8b7a6c5d4e3f/video-456.mp4`
+- Arquivo: `document-789.pdf` → Caminho: `evolution-go-medias/0c9a1f2e-5f4b-4a3c-9d0e-8b7a6c5d4e3f/document-789.pdf`
+
+**Retrocompatibilidade**: objetos gravados antes dessa mudança continuam na raiz de
+`evolution-go-medias/` (`evolution-go-medias/photo-123.jpg`) e seguem acessíveis pela URL
+já guardada. Nada é movido nem reescrito. Se o id da instância não estiver disponível, a
+gravação volta ao formato plano antigo em vez de gerar um caminho inválido.
 
 ---
 

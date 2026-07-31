@@ -35,8 +35,13 @@ func setBucketPolicy(client *minio.Client, bucketName string) error {
 	return client.SetBucketPolicy(context.Background(), bucketName, policy)
 }
 
-// generateFilePath creates a simple media folder structure
-// Format: evolution-go-medias/{filename}
+// generateFilePath creates the media folder structure by prefixing the media folder.
+// Format: evolution-go-medias/{fileName}
+//
+// fileName may be a plain name ("{messageId}.{ext}", the legacy flat layout) or a
+// relative path ("{instanceId}/{messageId}.{ext}", the per-instance layout). This
+// function only concatenates, so both produce a valid key and no caller needs a new
+// argument.
 func generateFilePath(fileName string) string {
 	return fmt.Sprintf("evolution-go-medias/%s", fileName)
 }
@@ -44,6 +49,11 @@ func generateFilePath(fileName string) string {
 // resolveFilePath determines if the input is a full path or just a filename
 // If it's just a filename, it assumes it's in the evolution-go-medias folder
 // If it's a full path, it returns it as-is
+//
+// Objects written before the per-instance layout keep working: callers hold either the
+// bare "{messageId}.{ext}" (prefixed here) or the full "evolution-go-medias/..." key
+// (returned as-is). Per-instance objects must be addressed by their full key, the same
+// way the presigned URL already exposes them.
 func (m *MinioMediaStorage) resolveFilePath(ctx context.Context, fileNameOrPath string) (string, error) {
 	// If the input already contains path separators, assume it's a full path
 	if strings.Contains(fileNameOrPath, "/") {
