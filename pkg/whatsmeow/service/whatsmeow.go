@@ -1599,7 +1599,11 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 				// Only process storage if download was successful
 				if err == nil && len(data) > 0 {
 					if mycli.config.MinioEnabled {
-						fileName := evt.Info.ID + extension
+						// Separa a mídia por instância já na origem: a chave final vira
+						// evolution-go-medias/<instanceId>/<messageId>.<ext>. Sem um id de
+						// instância utilizável, buildMediaFileName devolve só o nome do
+						// arquivo e a gravação segue no formato antigo (plano).
+						fileName := buildMediaFileName(mycli.userID, evt.Info.ID+extension)
 						storageStart := time.Now()
 
 						mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Uploading to S3/Minio - ID: %s, FileName: %s, Size: %d bytes", mycli.userID, evt.Info.ID, fileName, len(data))
