@@ -51,6 +51,15 @@ import (
 	"github.com/evolution-foundation/evolution-go/pkg/utils"
 )
 
+/*
+	Recuperações de app state em andamento, chaveadas por "<instanceID>|<coleção>".
+
+	Enquanto uma coleção está dessincronizada o whatsmeow dispara AppStateSyncError a
+	CADA notificação recebida — vários por minuto. Sem esta guarda, cada um deles
+	abriria um full sync novo da mesma coleção. Ver o case *events.AppStateSyncError.
+*/
+var appStateRecoveryInFlight sync.Map
+
 type WhatsmeowService interface {
 	StartClient(clientData *ClientData)
 	ConnectOnStartup(clientName string)
@@ -883,6 +892,63 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 				mycli.loggerWrapper.GetLogger(mycli.userID).LogWarn("[%s] Marked self as unavailable", mycli.userID)
 			}
 		}
+	case *events.AppStateSyncError:
+		/*
+			Coleção de app state dessincronizada — e ela não se conserta sozinha.
+
+			O WhatsApp guarda fixar, arquivar, silenciar e contatos em coleções de "app
+			state", e cada patch é verificado contra um LTHash. Quando o snapshot local
+			diverge do servidor, a verificação falha e o whatsmeow para de aplicar E de
+			ENVIAR patches daquela coleção: /chat/pin e /chat/archive passam a devolver
+			500 ("mismatching LTHash"), e o que é feito no celular nunca chega aqui.
+			Fixar e arquivar moram os dois em regular_low, então quebram juntos.
+
+			Reconectar NÃO resolve: a reconexão sincroniza a partir da versão local, que
+			é exatamente a versão quebrada — daí o erro se repetir a cada notificação.
+
+			A recuperação é o full sync: FetchAppState com fullSync=true apaga a versão
+			local e rebaixa tudo do servidor a partir do snapshot.
+		*/
+		mycli.loggerWrapper.GetLogger(mycli.userID).LogWarn(
+			"[%s] App state %s dessincronizado: %v", mycli.userID, evt.Name, evt.Error)
+
+		if evt.FullSync {
+			// Foi o próprio full sync que falhou — repetir só repetiria o erro.
+			mycli.loggerWrapper.GetLogger(mycli.userID).LogError(
+				"[%s] O full sync de %s também falhou — recuperação automática esgotada", mycli.userID, evt.Name)
+			return
+		}
+
+		// Uma recuperação por coleção de cada vez. O erro se repete a cada notificação
+		// enquanto a coleção está quebrada, e sem esta guarda cada repetição dispararia
+		// um full sync novo.
+		chaveDeRecuperacao := fmt.Sprintf("%s|%s", mycli.userID, evt.Name)
+		if _, jaRodando := appStateRecoveryInFlight.LoadOrStore(chaveDeRecuperacao, true); jaRodando {
+			return
+		}
+
+		/*
+			EM GOROUTINE, obrigatoriamente. Este handler é chamado de DENTRO de
+			fetchAppState, que segura o appStateSyncLock durante toda a operação.
+			Chamar FetchAppState aqui, na mesma pilha, travaria o cliente num deadlock
+			— o mutex não é reentrante.
+		*/
+		go func(nome appstate.WAPatchName, chave string) {
+			defer appStateRecoveryInFlight.Delete(chave)
+
+			mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo(
+				"[%s] Refazendo o app state %s do zero (full sync)...", mycli.userID, nome)
+
+			if err := mycli.WAClient.FetchAppState(context.Background(), nome, true, false); err != nil {
+				mycli.loggerWrapper.GetLogger(mycli.userID).LogError(
+					"[%s] Full sync de %s falhou: %v", mycli.userID, nome, err)
+				return
+			}
+
+			mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo(
+				"[%s] App state %s recuperado — fixar e arquivar voltam a funcionar", mycli.userID, nome)
+		}(evt.Name, chaveDeRecuperacao)
+		return
 	case *events.Connected, *events.PushNameSetting:
 		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] events.Connected to Whatsapp for user '%s'", mycli.userID, mycli.WAClient.Store.PushName)
 		if len(mycli.WAClient.Store.PushName) > 0 {
