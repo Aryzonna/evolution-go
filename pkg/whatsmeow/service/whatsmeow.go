@@ -1878,6 +1878,25 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 		}
 
 		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Chat archived", mycli.userID)
+	case *events.Pin:
+		doWebhook = true
+		postMap["event"] = "Pin"
+
+		// Espelho exato do case *events.Archive acima, inclusive no motivo de montar
+		// o mapa à mão em vez de fazer type assertion para map[string]interface{}:
+		// o evento aqui ainda é o CRU (*events.Pin), e a asserção daria panic.
+		//
+		// O whatsmeow já emitia este evento (appstate.IndexPin) — quem o descartava
+		// era este switch, que não tinha o case. Por isso o arquivar sincronizava do
+		// celular para o sistema e o fixar não.
+		postMap["data"] = map[string]interface{}{
+			"JID":          evt.JID,
+			"Timestamp":    evt.Timestamp,
+			"Action":       evt.Action,
+			"FromFullSync": evt.FromFullSync,
+		}
+
+		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Chat pinned", mycli.userID)
 	case *events.HistorySync:
 		doWebhook = true
 		postMap["event"] = "HistorySync"
@@ -2265,7 +2284,7 @@ func (w *whatsmeowService) CallWebhook(instance *instance_model.Instance, queueN
 			w.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] Event received of type %s", instance.Id, eventType)
 			w.sendToQueueOrWebhook(instance, queueName, jsonData)
 		}
-	case "ChatPresence", "Archive":
+	case "ChatPresence", "Archive", "Pin":
 		if contains(subscriptions, "CHAT_PRESENCE") {
 			w.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] Event received of type %s", instance.Id, eventType)
 			w.sendToQueueOrWebhook(instance, queueName, jsonData)
@@ -2559,7 +2578,7 @@ func (w *whatsmeowService) SendToGlobalQueues(eventType string, payload []byte, 
 				globalEventType = "PRESENCE"
 			case "HistorySync":
 				globalEventType = "HISTORY_SYNC"
-			case "ChatPresence", "Archive":
+			case "ChatPresence", "Archive", "Pin":
 				globalEventType = "CHAT_PRESENCE"
 			case "CallOffer", "CallAccept", "CallTerminate", "CallOfferNotice", "CallRelayLatency":
 				globalEventType = "CALL"
@@ -2621,7 +2640,7 @@ func (w *whatsmeowService) SendToGlobalQueues(eventType string, payload []byte, 
 			globalEventType = "PRESENCE"
 		case "HistorySync":
 			globalEventType = "HISTORY_SYNC"
-		case "ChatPresence", "Archive":
+		case "ChatPresence", "Archive", "Pin":
 			globalEventType = "CHAT_PRESENCE"
 		case "CallOffer", "CallAccept", "CallTerminate", "CallOfferNotice", "CallRelayLatency":
 			globalEventType = "CALL"
