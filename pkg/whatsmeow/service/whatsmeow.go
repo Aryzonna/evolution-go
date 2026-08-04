@@ -52,13 +52,23 @@ import (
 )
 
 /*
-	Recuperações de app state em andamento, chaveadas por "<instanceID>|<coleção>".
+	Recuperações de app state já tentadas, chaveadas por "<instanceID>|<coleção>".
 
 	Enquanto uma coleção está dessincronizada o whatsmeow dispara AppStateSyncError a
-	CADA notificação recebida — vários por minuto. Sem esta guarda, cada um deles
-	abriria um full sync novo da mesma coleção. Ver o case *events.AppStateSyncError.
+	CADA notificação recebida — foram seis em quatro segundos no caso que motivou isto.
+	Sem a guarda, cada um abriria um full sync novo e um pedido novo ao celular.
+
+	A chave só é liberada depois do COOLDOWN, e não quando a tentativa termina: o
+	segundo degrau da recuperação (a cópia do aparelho principal) é ASSÍNCRONO — o
+	pedido sai, a resposta demora, e os erros continuam pipocando nesse meio-tempo.
+	Liberar ao terminar faria uma tentativa nova a cada erro, justamente enquanto a
+	anterior ainda está a caminho.
+
+	Ver o case *events.AppStateSyncError.
 */
 var appStateRecoveryInFlight sync.Map
+
+const appStateRecoveryCooldown = 5 * time.Minute
 
 type WhatsmeowService interface {
 	StartClient(clientData *ClientData)
@@ -884,6 +894,15 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 		mycli.handleQRCodes(evt.Codes)
 		return
 	case *events.AppStateSyncComplete:
+		// `Recovery` marca a cópia limpa que pedimos ao aparelho principal quando a
+		// coleção estava quebrada (ver o case *events.AppStateSyncError). É a linha que
+		// diz que fixar e arquivar voltaram — sem ela, o sucesso é silencioso e não dá
+		// para distinguir de "o pedido nunca foi respondido".
+		if evt.Recovery {
+			mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo(
+				"[%s] App state %s recuperado pela cópia do aparelho (v%d) — fixar e arquivar voltam a funcionar",
+				mycli.userID, evt.Name, evt.Version)
+		}
 		if len(mycli.WAClient.Store.PushName) > 0 && evt.Name == appstate.WAPatchCriticalBlock {
 			err := mycli.WAClient.SendPresence(context.Background(), types.PresenceUnavailable)
 			if err != nil {
@@ -906,16 +925,27 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 			Reconectar NÃO resolve: a reconexão sincroniza a partir da versão local, que
 			é exatamente a versão quebrada — daí o erro se repetir a cada notificação.
 
-			A recuperação é o full sync: FetchAppState com fullSync=true apaga a versão
-			local e rebaixa tudo do servidor a partir do snapshot.
+			A recuperação tem DOIS DEGRAUS, e o segundo existe porque o primeiro não
+			basta quando o patch em si é o problema:
+
+			  1. Full sync (FetchAppState com fullSync=true) — apaga a versão local e
+			     rebaixa tudo do servidor. Resolve quando só o estado local divergiu.
+
+			  2. Quando o full sync falha NO MESMO PATCH, o defeito não está no que
+			     guardamos: é a cadeia de patches do servidor que não fecha para esta
+			     versão do whatsmeow, e refazer o download reencontra o mesmo patch.
+			     Aí se pede ao APARELHO PRINCIPAL uma cópia limpa da coleção
+			     (BuildAppStateRecoveryRequest). Essa cópia vem como snapshot com MAC
+			     por mutação e é aplicada por ProcessRecovery, que NÃO percorre a
+			     cadeia de patches — é assim que o patch quebrado deixa de importar.
 		*/
 		mycli.loggerWrapper.GetLogger(mycli.userID).LogWarn(
 			"[%s] App state %s dessincronizado: %v", mycli.userID, evt.Name, evt.Error)
 
 		if evt.FullSync {
-			// Foi o próprio full sync que falhou — repetir só repetiria o erro.
-			mycli.loggerWrapper.GetLogger(mycli.userID).LogError(
-				"[%s] O full sync de %s também falhou — recuperação automática esgotada", mycli.userID, evt.Name)
+			// Este é o erro do full sync que a goroutine abaixo disparou — ela já o
+			// recebe como valor de retorno e é quem escala. Tratar aqui de novo faria
+			// o trabalho em dobro.
 			return
 		}
 
@@ -934,19 +964,54 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 			— o mutex não é reentrante.
 		*/
 		go func(nome appstate.WAPatchName, chave string) {
-			defer appStateRecoveryInFlight.Delete(chave)
+			// Ver o cabeçalho de appStateRecoveryInFlight: a liberação é pelo relógio,
+			// não pelo fim desta função.
+			defer func() {
+				time.AfterFunc(appStateRecoveryCooldown, func() {
+					appStateRecoveryInFlight.Delete(chave)
+				})
+			}()
 
 			mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo(
 				"[%s] Refazendo o app state %s do zero (full sync)...", mycli.userID, nome)
 
-			if err := mycli.WAClient.FetchAppState(context.Background(), nome, true, false); err != nil {
+			if err := mycli.WAClient.FetchAppState(context.Background(), nome, true, false); err == nil {
+				mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo(
+					"[%s] App state %s recuperado pelo full sync — fixar e arquivar voltam a funcionar",
+					mycli.userID, nome)
+				return
+			} else {
+				mycli.loggerWrapper.GetLogger(mycli.userID).LogWarn(
+					"[%s] Full sync de %s falhou (%v) — escalando para a cópia do aparelho principal",
+					mycli.userID, nome, err)
+			}
+
+			/*
+				DEGRAU 2. Pede ao aparelho principal (o celular) uma cópia limpa da
+				coleção. Não desloga ninguém e não apaga nada — é só um peer message
+				para o próprio número.
+
+				A resposta chega sozinha: o whatsmeow trata o
+				PEER_DATA_OPERATION_RESPONSE_MESSAGE em handleAppStateRecovery, aplica
+				via ProcessRecovery e emite AppStateSyncComplete{Recovery:true}. Não há
+				o que esperar aqui.
+
+				DEPENDE DO CELULAR ESTAR ONLINE. Se ele não responder, nada acontece e o
+				erro continua aparecendo — o próximo AppStateSyncError tenta de novo.
+			*/
+			mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo(
+				"[%s] Pedindo ao aparelho principal uma cópia limpa de %s...", mycli.userID, nome)
+
+			pedido := whatsmeow.BuildAppStateRecoveryRequest(nome)
+			if _, err := mycli.WAClient.SendPeerMessage(context.Background(), pedido); err != nil {
 				mycli.loggerWrapper.GetLogger(mycli.userID).LogError(
-					"[%s] Full sync de %s falhou: %v", mycli.userID, nome, err)
+					"[%s] Não consegui pedir a cópia de %s: %v", mycli.userID, nome, err)
 				return
 			}
 
 			mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo(
-				"[%s] App state %s recuperado — fixar e arquivar voltam a funcionar", mycli.userID, nome)
+				"[%s] Pedido de recuperação de %s enviado — a resposta vem do celular e é aplicada sozinha. "+
+					"Se nada mudar, confira se o aparelho está online.", mycli.userID, nome)
 		}(evt.Name, chaveDeRecuperacao)
 		return
 	case *events.Connected, *events.PushNameSetting:
