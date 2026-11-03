@@ -242,10 +242,19 @@ func (u *userService) performCheckUser(client *whatsmeow.Client, numbers []strin
 	shouldRetry := false
 
 	for _, item := range resp {
-		// Consultar LID Store para obter LID associado ao JID
+		// O whatsmeow consulta com addressing_mode=lid: item.JID pode vir @lid, com o telefone
+		// em item.PhoneNumber. O contrato deste endpoint é telefone em JID/RemoteJID e o LID no campo LID.
+		pnJID := item.JID
+		if !item.PhoneNumber.IsEmpty() {
+			pnJID = item.PhoneNumber
+		}
+
 		var lidStr *string
-		if client.Store.LIDs != nil {
-			if lid, err := client.Store.LIDs.GetLIDForPN(context.TODO(), item.JID); err == nil && !lid.IsEmpty() {
+		if item.JID.Server == types.HiddenUserServer {
+			lidString := item.JID.String()
+			lidStr = &lidString
+		} else if client.Store.LIDs != nil {
+			if lid, err := client.Store.LIDs.GetLIDForPN(context.TODO(), pnJID); err == nil && !lid.IsEmpty() {
 				lidString := fmt.Sprintf("%v", lid)
 				lidStr = &lidString
 			}
@@ -255,7 +264,7 @@ func (u *userService) performCheckUser(client *whatsmeow.Client, numbers []strin
 		remoteJID := item.Query // Default to original query
 		if item.IsIn {
 			// When user exists on WhatsApp, use the JID returned by WhatsApp
-			remoteJID = fmt.Sprintf("%v", item.JID)
+			remoteJID = fmt.Sprintf("%v", pnJID)
 		} else if formatJid {
 			// If user not found and we used formatJid=true, we should retry with formatJid=false
 			shouldRetry = true
@@ -265,7 +274,7 @@ func (u *userService) performCheckUser(client *whatsmeow.Client, numbers []strin
 			var msg = User{
 				Query:        item.Query,
 				IsInWhatsapp: item.IsIn,
-				JID:          fmt.Sprintf("%v", item.JID),
+				JID:          fmt.Sprintf("%v", pnJID),
 				RemoteJID:    remoteJID,
 				LID:          lidStr,
 				VerifiedName: item.VerifiedName.Details.GetVerifiedName(),
@@ -275,7 +284,7 @@ func (u *userService) performCheckUser(client *whatsmeow.Client, numbers []strin
 			var msg = User{
 				Query:        item.Query,
 				IsInWhatsapp: item.IsIn,
-				JID:          fmt.Sprintf("%v", item.JID),
+				JID:          fmt.Sprintf("%v", pnJID),
 				RemoteJID:    remoteJID,
 				LID:          lidStr,
 				VerifiedName: "",

@@ -598,8 +598,13 @@ func (s *sendService) checkSingleUserExists(client *whatsmeow.Client, phone stri
 		return "", false, nil // Not an error, just not found
 	}
 
-	// Return the remoteJID from WhatsApp's response
-	remoteJID := fmt.Sprintf("%v", resp[0].JID)
+	// Return the remoteJID from WhatsApp's response. A consulta é addressing_mode=lid:
+	// JID pode vir @lid; o destinatário (e o eco publicado) segue sendo o telefone.
+	jid := resp[0].JID
+	if !resp[0].PhoneNumber.IsEmpty() {
+		jid = resp[0].PhoneNumber
+	}
+	remoteJID := fmt.Sprintf("%v", jid)
 	return remoteJID, true, nil
 }
 
