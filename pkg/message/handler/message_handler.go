@@ -1,6 +1,7 @@
 package message_handler
 
 import (
+	"errors"
 	"net/http"
 
 	instance_model "github.com/evolution-foundation/evolution-go/pkg/instance/model"
@@ -14,6 +15,7 @@ type MessageHandler interface {
 	MarkRead(ctx *gin.Context)
 	MarkPlayed(ctx *gin.Context)
 	DownloadMedia(ctx *gin.Context)
+	MediaRetry(ctx *gin.Context)
 	GetMessageStatus(ctx *gin.Context)
 	DeleteMessageEveryone(ctx *gin.Context)
 	EditMessage(ctx *gin.Context)
@@ -258,6 +260,46 @@ func (m *messageHandler) DownloadMedia(ctx *gin.Context) {
 	}
 
 	ctx.JSON(http.StatusOK, gin.H{"message": "success", "data": responseData})
+}
+
+// MediaRetry asks the phone to re-upload a media the WhatsApp server no longer has
+// @Summary Request media from phone
+// @Description Sends a media retry receipt to the connected phone and waits for the new directPath. Use when downloading returns 403/404/410.
+// @Tags Message
+// @Accept json
+// @Produce json
+// @Param message body message_service.MediaRetryStruct true "Media retry"
+// @Success 200 {object} gin.H "success"
+// @Failure 400 {object} gin.H "Error on validation"
+// @Failure 404 {object} gin.H "Media no longer on the phone"
+// @Failure 504 {object} gin.H "Phone did not answer in time"
+// @Router /message/mediaretry [post]
+func (m *messageHandler) MediaRetry(ctx *gin.Context) {
+	instance, ok := ctx.MustGet("instance").(*instance_model.Instance)
+	if !ok {
+		ctx.JSON(http.StatusInternalServerError, gin.H{"error": "instance not found"})
+		return
+	}
+
+	var data *message_service.MediaRetryStruct
+	if err := ctx.ShouldBindBodyWithJSON(&data); err != nil {
+		ctx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	result, err := m.messageService.RequestMediaRetry(data, instance)
+	switch {
+	case err == nil:
+		ctx.JSON(http.StatusOK, gin.H{"message": "success", "data": result})
+	case errors.Is(err, message_service.ErrMediaRetryInvalid):
+		ctx.JSON(http.StatusBadRequest, gin.H{"error": err.Error(), "reason": "invalid"})
+	case errors.Is(err, message_service.ErrMediaRetryNotOnPhone):
+		ctx.JSON(http.StatusNotFound, gin.H{"error": err.Error(), "reason": "not_on_phone"})
+	case errors.Is(err, message_service.ErrMediaRetryTimeout):
+		ctx.JSON(http.StatusGatewayTimeout, gin.H{"error": err.Error(), "reason": "timeout"})
+	default:
+		ctx.JSON(http.StatusBadGateway, gin.H{"error": err.Error(), "reason": "failed"})
+	}
 }
 
 // GetMessageStatus get message status
