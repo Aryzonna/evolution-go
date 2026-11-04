@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	instance_model "github.com/evolution-foundation/evolution-go/pkg/instance/model"
@@ -55,6 +56,79 @@ var (
 	ErrMediaRetryInvalid    = errors.New("pedido inválido")
 )
 
+/*
+A RESPOSTA QUE CHEGA DEPOIS DO PRAZO NÃO PODE SE PERDER.
+
+Para responder, o celular sobe o arquivo inteiro de novo: medido em 04/11/2026, um vídeo
+respondeu 37 s depois do pedido, com a espera já esgotada — e um segundo pedido para a
+mesma mensagem não teve resposta nenhuma. O celular responde uma vez só. Então, quando o
+prazo acaba, o ouvinte continua de pé por mais `esperaPelaRespostaAtrasada` e guarda o que
+vier aqui; o próximo pedido para a mesma mensagem é atendido na hora, sem incomodar o
+celular de novo.
+
+O evento é guardado CIFRADO: quem pede de novo manda a mediaKey, e só com ela se lê.
+*/
+const (
+	esperaPelaRespostaAtrasada = 5 * time.Minute
+	validadeDaRespostaGuardada = 10 * time.Minute
+)
+
+type respostaGuardada struct {
+	evt *events.MediaRetry
+	em  time.Time
+}
+
+var (
+	respostasGuardadas   = map[string]respostaGuardada{}
+	respostasGuardadasMu sync.Mutex
+)
+
+func chaveDaResposta(instanceID, messageID string) string { return instanceID + "|" + messageID }
+
+func guardarResposta(chave string, evt *events.MediaRetry) {
+	respostasGuardadasMu.Lock()
+	defer respostasGuardadasMu.Unlock()
+	agora := time.Now()
+	for k, r := range respostasGuardadas {
+		if agora.Sub(r.em) > validadeDaRespostaGuardada {
+			delete(respostasGuardadas, k)
+		}
+	}
+	respostasGuardadas[chave] = respostaGuardada{evt: evt, em: agora}
+}
+
+func tirarRespostaGuardada(chave string) *events.MediaRetry {
+	respostasGuardadasMu.Lock()
+	defer respostasGuardadasMu.Unlock()
+	r, ok := respostasGuardadas[chave]
+	if !ok {
+		return nil
+	}
+	delete(respostasGuardadas, chave)
+	if time.Since(r.em) > validadeDaRespostaGuardada {
+		return nil
+	}
+	return r.evt
+}
+
+// lerResposta decifra a resposta do celular e a traduz nos erros que o handler conhece.
+func lerResposta(evt *events.MediaRetry, mediaKey []byte) (*MediaRetryResult, error) {
+	notif, err := whatsmeow.DecryptMediaRetryNotification(evt, mediaKey)
+	if errors.Is(err, whatsmeow.ErrMediaNotAvailableOnPhone) {
+		return nil, ErrMediaRetryNotOnPhone
+	}
+	if err != nil {
+		return nil, fmt.Errorf("resposta do celular ilegível: %w", err)
+	}
+	if notif.GetResult() != waMmsRetry.MediaRetryNotification_SUCCESS || notif.GetDirectPath() == "" {
+		if notif.GetResult() == waMmsRetry.MediaRetryNotification_NOT_FOUND {
+			return nil, ErrMediaRetryNotOnPhone
+		}
+		return nil, fmt.Errorf("o celular não reenviou a mídia (%s)", notif.GetResult().String())
+	}
+	return &MediaRetryResult{DirectPath: notif.GetDirectPath()}, nil
+}
+
 func (m *messageService) RequestMediaRetry(data *MediaRetryStruct, instance *instance_model.Instance) (*MediaRetryResult, error) {
 	if data == nil || strings.TrimSpace(data.MessageID) == "" || strings.TrimSpace(data.Chat) == "" || data.MediaKey == "" {
 		return nil, fmt.Errorf("%w: messageId, chat e mediaKey são obrigatórios", ErrMediaRetryInvalid)
@@ -84,6 +158,15 @@ func (m *messageService) RequestMediaRetry(data *MediaRetryStruct, instance *ins
 		info.Sender = sender
 	}
 
+	logger := m.loggerWrapper.GetLogger(instance.Id)
+	chave := chaveDaResposta(instance.Id, data.MessageID)
+
+	/* Uma resposta que chegou depois do prazo de um pedido anterior atende este na hora. */
+	if guardada := tirarRespostaGuardada(chave); guardada != nil {
+		logger.LogInfo("[%s] media retry: %s atendido pela resposta guardada do celular", instance.Id, data.MessageID)
+		return lerResposta(guardada, mediaKey)
+	}
+
 	client, err := m.ensureClientConnected(instance.Id)
 	if err != nil {
 		return nil, err
@@ -109,12 +192,16 @@ func (m *messageService) RequestMediaRetry(data *MediaRetryStruct, instance *ins
 			}
 		}
 	})
-	defer client.RemoveEventHandler(ouvinte)
+	removido := false
+	defer func() {
+		if !removido {
+			client.RemoveEventHandler(ouvinte)
+		}
+	}()
 
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	logger := m.loggerWrapper.GetLogger(instance.Id)
 	if err := client.SendMediaRetryReceipt(ctx, info, mediaKey); err != nil {
 		logger.LogError("[%s] media retry: falha ao enviar o pedido de %s: %v", instance.Id, data.MessageID, err)
 		return nil, fmt.Errorf("falha ao pedir a mídia ao celular: %w", err)
@@ -123,25 +210,25 @@ func (m *messageService) RequestMediaRetry(data *MediaRetryStruct, instance *ins
 
 	select {
 	case evt := <-resposta:
-		notif, err := whatsmeow.DecryptMediaRetryNotification(evt, mediaKey)
-		if errors.Is(err, whatsmeow.ErrMediaNotAvailableOnPhone) {
-			logger.LogInfo("[%s] media retry: %s não está mais no celular", instance.Id, data.MessageID)
-			return nil, ErrMediaRetryNotOnPhone
-		}
+		resultado, err := lerResposta(evt, mediaKey)
 		if err != nil {
-			return nil, fmt.Errorf("resposta do celular ilegível: %w", err)
-		}
-		if notif.GetResult() != waMmsRetry.MediaRetryNotification_SUCCESS || notif.GetDirectPath() == "" {
-			logger.LogInfo("[%s] media retry: %s respondeu %s", instance.Id, data.MessageID, notif.GetResult().String())
-			if notif.GetResult() == waMmsRetry.MediaRetryNotification_NOT_FOUND {
-				return nil, ErrMediaRetryNotOnPhone
-			}
-			return nil, fmt.Errorf("o celular não reenviou a mídia (%s)", notif.GetResult().String())
+			logger.LogInfo("[%s] media retry: %s — %v", instance.Id, data.MessageID, err)
+			return nil, err
 		}
 		logger.LogInfo("[%s] media retry: %s reenviada pelo celular", instance.Id, data.MessageID)
-		return &MediaRetryResult{DirectPath: notif.GetDirectPath()}, nil
+		return resultado, nil
 	case <-ctx.Done():
-		logger.LogInfo("[%s] media retry: sem resposta do celular para %s em %s", instance.Id, data.MessageID, timeout)
+		logger.LogInfo("[%s] media retry: sem resposta do celular para %s em %s; guardando a resposta se ela vier", instance.Id, data.MessageID, timeout)
+		removido = true
+		go func() {
+			defer client.RemoveEventHandler(ouvinte)
+			select {
+			case evt := <-resposta:
+				guardarResposta(chave, evt)
+				logger.LogInfo("[%s] media retry: resposta atrasada de %s guardada", instance.Id, data.MessageID)
+			case <-time.After(esperaPelaRespostaAtrasada):
+			}
+		}()
 		return nil, ErrMediaRetryTimeout
 	}
 }
