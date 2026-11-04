@@ -14,6 +14,7 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"os"
 	"os/exec"
 	"regexp"
 	"strconv"
@@ -40,6 +41,7 @@ type SendService interface {
 	SendLink(data *LinkStruct, instance *instance_model.Instance) (*MessageSendStruct, error)
 	SendMediaUrl(data *MediaStruct, instance *instance_model.Instance) (*MessageSendStruct, error)
 	SendMediaFile(data *MediaStruct, fileData []byte, instance *instance_model.Instance) (*MessageSendStruct, error)
+	SendMediaFileReader(data *MediaStruct, arquivo io.ReadSeeker, tamanho int64, instance *instance_model.Instance) (*MessageSendStruct, error)
 	SendPoll(data *PollStruct, instance *instance_model.Instance) (*MessageSendStruct, error)
 	SendPollVote(data *PollVoteStruct, instance *instance_model.Instance) (*MessageSendStruct, error)
 	SendSticker(data *StickerStruct, instance *instance_model.Instance) (*MessageSendStruct, error)
@@ -1082,28 +1084,7 @@ func (s *sendService) sendMediaFileWithRetry(data *MediaStruct, fileData []byte,
 			}
 			mediaType = "ImageMessage"
 		case "video":
-			if isNewsletter {
-				media = &waE2E.Message{VideoMessage: &waE2E.VideoMessage{
-					Caption:    proto.String(data.Caption),
-					URL:        &uploaded.URL,
-					DirectPath: &uploaded.DirectPath,
-					Mimetype:   proto.String(mimeType),
-					FileSHA256: uploaded.FileSHA256,
-					FileLength: &uploaded.FileLength,
-				}}
-			} else {
-				media = &waE2E.Message{VideoMessage: &waE2E.VideoMessage{
-					Caption:       proto.String(data.Caption),
-					URL:           proto.String(uploaded.URL),
-					DirectPath:    proto.String(uploaded.DirectPath),
-					MediaKey:      uploaded.MediaKey,
-					Mimetype:      proto.String(mimeType),
-					FileEncSHA256: uploaded.FileEncSHA256,
-					FileSHA256:    uploaded.FileSHA256,
-					FileLength:    proto.Uint64(uint64(len(fileData))),
-				}}
-			}
-			mediaType = "VideoMessage"
+			media, mediaType = mensagemDeVideo(data, uploaded, mimeType, uint64(len(fileData)), isNewsletter)
 		case "ptv":
 			if isNewsletter {
 				media = &waE2E.Message{PtvMessage: &waE2E.VideoMessage{
@@ -1158,42 +1139,7 @@ func (s *sendService) sendMediaFileWithRetry(data *MediaStruct, fileData []byte,
 			if mimeType == "application/pdf" {
 				jpegThumb = makePDFThumbnail(fileData, 200)
 			}
-			if isNewsletter {
-				media = &waE2E.Message{DocumentMessage: &waE2E.DocumentMessage{
-					FileName:      &data.Filename,
-					Caption:       proto.String(data.Caption),
-					URL:           &uploaded.URL,
-					DirectPath:    &uploaded.DirectPath,
-					Mimetype:      proto.String(mimeType),
-					FileSHA256:    uploaded.FileSHA256,
-					FileLength:    &uploaded.FileLength,
-					JPEGThumbnail: jpegThumb,
-				}}
-			} else {
-				media = &waE2E.Message{DocumentMessage: &waE2E.DocumentMessage{
-					FileName:      &data.Filename,
-					Caption:       proto.String(data.Caption),
-					URL:           proto.String(uploaded.URL),
-					DirectPath:    proto.String(uploaded.DirectPath),
-					MediaKey:      uploaded.MediaKey,
-					Mimetype:      proto.String(mimeType),
-					FileEncSHA256: uploaded.FileEncSHA256,
-					FileSHA256:    uploaded.FileSHA256,
-					FileLength:    proto.Uint64(uint64(len(fileData))),
-					JPEGThumbnail: jpegThumb,
-				}}
-			}
-
-			if media.GetDocumentMessage().GetCaption() != "" {
-				media.DocumentWithCaptionMessage = &waE2E.FutureProofMessage{
-					Message: &waE2E.Message{
-						DocumentMessage: media.DocumentMessage,
-					},
-				}
-				media.DocumentMessage = nil
-			}
-
-			mediaType = "DocumentMessage"
+			media, mediaType = mensagemDeDocumento(data, uploaded, mimeType, uint64(len(fileData)), isNewsletter, jpegThumb)
 		default:
 			return nil, errors.New("invalid media type")
 		}
@@ -1225,6 +1171,216 @@ func (s *sendService) sendMediaFileWithRetry(data *MediaStruct, fileData []byte,
 		}
 
 		s.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] SendMediaFile successful on attempt %d", instance.Id, attempt)
+		return message, nil
+	}
+
+	return nil, fmt.Errorf("failed to send media file after %d attempts", maxRetries)
+}
+
+/*
+mensagemDeVideo e mensagemDeDocumento montam a mensagem a partir do que o upload devolveu.
+Saíram de dentro de sendMediaFileWithRetry para o caminho por bytes e o caminho por leitor
+(SendMediaFileReader) produzirem EXATAMENTE a mesma mensagem — duas cópias desses campos
+divergiriam na primeira mudança. `tamanho` é o tamanho do arquivo original: no caminho por
+bytes, len(fileData); no por leitor, o tamanho que veio no multipart.
+*/
+func mensagemDeVideo(data *MediaStruct, uploaded whatsmeow.UploadResponse, mimeType string, tamanho uint64, isNewsletter bool) (*waE2E.Message, string) {
+	if isNewsletter {
+		return &waE2E.Message{VideoMessage: &waE2E.VideoMessage{
+			Caption:    proto.String(data.Caption),
+			URL:        &uploaded.URL,
+			DirectPath: &uploaded.DirectPath,
+			Mimetype:   proto.String(mimeType),
+			FileSHA256: uploaded.FileSHA256,
+			FileLength: &uploaded.FileLength,
+		}}, "VideoMessage"
+	}
+	return &waE2E.Message{VideoMessage: &waE2E.VideoMessage{
+		Caption:       proto.String(data.Caption),
+		URL:           proto.String(uploaded.URL),
+		DirectPath:    proto.String(uploaded.DirectPath),
+		MediaKey:      uploaded.MediaKey,
+		Mimetype:      proto.String(mimeType),
+		FileEncSHA256: uploaded.FileEncSHA256,
+		FileSHA256:    uploaded.FileSHA256,
+		FileLength:    proto.Uint64(tamanho),
+	}}, "VideoMessage"
+}
+
+func mensagemDeDocumento(data *MediaStruct, uploaded whatsmeow.UploadResponse, mimeType string, tamanho uint64, isNewsletter bool, jpegThumb []byte) (*waE2E.Message, string) {
+	var media *waE2E.Message
+	if isNewsletter {
+		media = &waE2E.Message{DocumentMessage: &waE2E.DocumentMessage{
+			FileName:      &data.Filename,
+			Caption:       proto.String(data.Caption),
+			URL:           &uploaded.URL,
+			DirectPath:    &uploaded.DirectPath,
+			Mimetype:      proto.String(mimeType),
+			FileSHA256:    uploaded.FileSHA256,
+			FileLength:    &uploaded.FileLength,
+			JPEGThumbnail: jpegThumb,
+		}}
+	} else {
+		media = &waE2E.Message{DocumentMessage: &waE2E.DocumentMessage{
+			FileName:      &data.Filename,
+			Caption:       proto.String(data.Caption),
+			URL:           proto.String(uploaded.URL),
+			DirectPath:    proto.String(uploaded.DirectPath),
+			MediaKey:      uploaded.MediaKey,
+			Mimetype:      proto.String(mimeType),
+			FileEncSHA256: uploaded.FileEncSHA256,
+			FileSHA256:    uploaded.FileSHA256,
+			FileLength:    proto.Uint64(tamanho),
+			JPEGThumbnail: jpegThumb,
+		}}
+	}
+
+	if media.GetDocumentMessage().GetCaption() != "" {
+		media.DocumentWithCaptionMessage = &waE2E.FutureProofMessage{
+			Message: &waE2E.Message{
+				DocumentMessage: media.DocumentMessage,
+			},
+		}
+		media.DocumentMessage = nil
+	}
+
+	return media, "DocumentMessage"
+}
+
+/*
+sobeEmStream diz quais tipos sobem LENDO DO ARQUIVO, sem nunca tê-lo inteiro na memória.
+
+São os que podem ser enormes (documento vai a 2 GB no WhatsApp) e que não precisam dos
+bytes para nada além do upload. Imagem e áudio ficam no caminho por bytes: a imagem gera
+miniatura e o áudio é convertido para opus, e os dois são pequenos.
+*/
+func sobeEmStream(tipo string) bool {
+	return tipo == "video" || tipo == "document"
+}
+
+/*
+SendMediaFileReader é o envio por multipart sem io.ReadAll.
+
+Antes, o handler lia o arquivo inteiro e o passava como []byte até o client.Upload, que
+criptografa em mais um buffer: um documento de 1,9 GB virava vários GB de RAM neste
+processo, que atende TODAS as instâncias. Aqui o upload usa o UploadReader do whatsmeow,
+que criptografa para um arquivo temporário, e a memória fica constante.
+
+`arquivo` é o que o multipart abriu (o Gin já guarda em disco o que passa de 32 MB) e
+`tamanho` o que o multipart declarou. A mensagem que sai é a mesma do caminho por bytes.
+*/
+func (s *sendService) SendMediaFileReader(data *MediaStruct, arquivo io.ReadSeeker, tamanho int64, instance *instance_model.Instance) (*MessageSendStruct, error) {
+	if !sobeEmStream(data.Type) {
+		if _, err := arquivo.Seek(0, io.SeekStart); err != nil {
+			return nil, err
+		}
+		fileData, err := io.ReadAll(arquivo)
+		if err != nil {
+			return nil, err
+		}
+		return s.SendMediaFile(data, fileData, instance)
+	}
+	return s.sendMediaFileReaderWithRetry(data, arquivo, tamanho, instance, 3)
+}
+
+func (s *sendService) sendMediaFileReaderWithRetry(data *MediaStruct, arquivo io.ReadSeeker, tamanho int64, instance *instance_model.Instance, maxRetries int) (*MessageSendStruct, error) {
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		s.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] SendMediaFileReader attempt %d/%d (%d bytes)", instance.Id, attempt, maxRetries, tamanho)
+
+		client, err := s.ensureClientConnectedWithRetry(instance.Id, 2)
+		if err != nil {
+			if attempt == maxRetries {
+				return nil, err
+			}
+			continue
+		}
+
+		// Cada tentativa relê do começo: a anterior pode ter consumido o arquivo.
+		if _, err := arquivo.Seek(0, io.SeekStart); err != nil {
+			return nil, err
+		}
+		mime, _ := mimetype.DetectReader(arquivo)
+		mimeType := mime.String()
+		if _, err := arquivo.Seek(0, io.SeekStart); err != nil {
+			return nil, err
+		}
+
+		var uploadType whatsmeow.MediaType
+		switch data.Type {
+		case "video":
+			if mimeType != "video/mp4" {
+				errMsg := fmt.Sprintf("Invalid file format: '%s'. Only 'video/mp4' is accepted", mimeType)
+				return nil, errors.New(errMsg)
+			}
+			uploadType = whatsmeow.MediaVideo
+		case "document":
+			uploadType = whatsmeow.MediaDocument
+		default:
+			return nil, errors.New("invalid media type")
+		}
+
+		isNewsletter := strings.Contains(data.Number, "@newsletter")
+		if isNewsletter && data.Type == "document" {
+			return nil, errors.New("documentos não são suportados em canais do WhatsApp. Use imagem, vídeo, áudio ou enquete")
+		}
+
+		s.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] SendMediaFileReader - Upload iniciado (Newsletter: %v)...", instance.Id, isNewsletter)
+
+		var uploaded whatsmeow.UploadResponse
+		if isNewsletter {
+			uploaded, err = client.UploadNewsletterReader(context.Background(), arquivo, uploadType)
+			s.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] Newsletter upload - Handle: %s", instance.Id, uploaded.Handle)
+		} else {
+			// tempFile nil: o whatsmeow cria o temporário da criptografia e o apaga ao fim.
+			uploaded, err = client.UploadReader(context.Background(), arquivo, nil, uploadType)
+		}
+		if err != nil {
+			return nil, err
+		}
+
+		s.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] Media uploaded with size %d", instance.Id, uploaded.FileLength)
+
+		var media *waE2E.Message
+		var mediaType string
+		switch data.Type {
+		case "video":
+			media, mediaType = mensagemDeVideo(data, uploaded, mimeType, uint64(tamanho), isNewsletter)
+		case "document":
+			var jpegThumb []byte
+			if mimeType == "application/pdf" {
+				if _, err := arquivo.Seek(0, io.SeekStart); err == nil {
+					jpegThumb = makePDFThumbnailFromReader(arquivo, 200)
+				}
+			}
+			media, mediaType = mensagemDeDocumento(data, uploaded, mimeType, uint64(tamanho), isNewsletter, jpegThumb)
+		}
+
+		message, err := s.SendMessage(instance, media, mediaType, &SendDataStruct{
+			Id:              data.Id,
+			Number:          data.Number,
+			Quoted:          data.Quoted,
+			Delay:           data.Delay,
+			MentionAll:      data.MentionAll,
+			MentionedJID:    data.MentionedJID,
+			FormatJid:       data.FormatJid,
+			MediaHandle:     uploaded.Handle,
+			ForwardingScore: data.ForwardingScore,
+		})
+
+		if err != nil {
+			if strings.Contains(err.Error(), "client disconnected") || strings.Contains(err.Error(), "no active session") {
+				s.loggerWrapper.GetLogger(instance.Id).LogWarn("[%s] SendMediaFileReader failed due to disconnection on attempt %d/%d: %v", instance.Id, attempt, maxRetries, err)
+				if attempt < maxRetries {
+					waitTime := time.Duration(attempt) * time.Second
+					s.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] Waiting %v before retry", instance.Id, waitTime)
+					time.Sleep(waitTime)
+					continue
+				}
+			}
+			return nil, err
+		}
+
+		s.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] SendMediaFileReader successful on attempt %d", instance.Id, attempt)
 		return message, nil
 	}
 
@@ -2201,6 +2357,17 @@ func makeJPEGThumbnail(fileData []byte, maxWidth int) []byte {
 // pdftoppm is not installed or rasterization fails, so callers can gracefully
 // send the document without a preview instead of failing the request.
 func makePDFThumbnail(fileData []byte, maxWidth int) []byte {
+	return makePDFThumbnailFromReader(bytes.NewReader(fileData), maxWidth)
+}
+
+/*
+makePDFThumbnailFromReader é a mesma miniatura, lida de um leitor.
+
+Quando o leitor é um arquivo em disco (o multipart grande), o pdftoppm recebe o CAMINHO e
+lê só a primeira página. Pela entrada padrão ele teria de receber o PDF inteiro, e um
+documento de 2 GB passaria todo pelo cano só para desenhar uma miniatura.
+*/
+func makePDFThumbnailFromReader(r io.Reader, maxWidth int) []byte {
 	if _, err := exec.LookPath("pdftoppm"); err != nil {
 		return nil
 	}
@@ -2220,7 +2387,11 @@ func makePDFThumbnail(fileData []byte, maxWidth int) []byte {
 		"-scale-to-x", strconv.Itoa(scaleWidth),
 		"-scale-to-y", "-1",
 	)
-	cmd.Stdin = bytes.NewReader(fileData)
+	if f, ok := r.(*os.File); ok {
+		cmd.Args = append(cmd.Args, f.Name())
+	} else {
+		cmd.Stdin = r
+	}
 
 	var out bytes.Buffer
 	cmd.Stdout = &out

@@ -207,11 +207,6 @@ func (s *sendHandler) SendMedia(ctx *gin.Context) {
 			return
 		}
 		defer fileData.Close()
-		fileBytes, err := io.ReadAll(fileData)
-		if err != nil {
-			ctx.JSON(http.StatusInternalServerError, gin.H{"error": "cannot read file"})
-			return
-		}
 
 		// Create MediaStruct
 		data = &send_service.MediaStruct{
@@ -226,8 +221,9 @@ func (s *sendHandler) SendMedia(ctx *gin.Context) {
 			Quoted:       quoted,
 		}
 
-		// Pass fileBytes to the send service
-		message, err := s.sendMessageService.SendMediaFile(data, fileBytes, instance)
+		// O arquivo vai ABERTO, não lido: vídeo e documento sobem em stream (até 2 GB no
+		// WhatsApp) sem passar inteiros pela memória — ver SendMediaFileReader.
+		message, err := s.sendMessageService.SendMediaFileReader(data, fileData, file.Size, instance)
 		if err != nil {
 			ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
