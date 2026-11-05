@@ -353,29 +353,39 @@ func (g *groupService) CreateGroup(data *CreateGroupStruct, instance *instance_m
 		return nil, err
 	}
 
+	// failedDetails leva o código de cada recusa (403 = a privacidade da pessoa exige
+	// convite) — "failed" continua só com os JIDs, para quem já consome a resposta.
 	var failed []types.JID
+	failedDetails := []gin.H{}
+	var added []types.JID
 	for _, participant := range resp.Participants {
 		if participant.Error != 0 {
 			failed = append(failed, participant.JID)
+			failedDetails = append(failedDetails, gin.H{"jid": participant.JID, "error": participant.Error})
+		} else {
+			added = append(added, participant.JID)
 		}
 	}
 
-	var added []types.JID
+	// O grupo JÁ EXISTE neste ponto. Uma falha nesta releitura não pode virar erro da
+	// criação: quem chamou tentaria de novo e criaria um segundo grupo igual.
 	infoResp, err := client.GetGroupInfo(context.Background(), resp.JID)
 	if err != nil {
-		g.loggerWrapper.GetLogger(instance.Id).LogError("[%s] error get group info: %v", instance.Id, err)
-		return nil, err
-	}
-	for _, add := range infoResp.Participants {
-		added = append(added, add.JID)
+		g.loggerWrapper.GetLogger(instance.Id).LogWarn("[%s] group created but info failed: %v", instance.Id, err)
+	} else {
+		added = nil
+		for _, add := range infoResp.Participants {
+			added = append(added, add.JID)
+		}
 	}
 
 	response := gin.H{
-		"jid":    resp.JID,
-		"name":   resp.Name,
-		"owner":  resp.OwnerJID,
-		"added":  added,
-		"failed": failed,
+		"jid":           resp.JID,
+		"name":          resp.Name,
+		"owner":         resp.OwnerJID,
+		"added":         added,
+		"failed":        failed,
+		"failedDetails": failedDetails,
 	}
 
 	return response, nil
