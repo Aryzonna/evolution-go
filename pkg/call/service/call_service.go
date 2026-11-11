@@ -152,7 +152,7 @@ func (c *callService) RejectCall(data *RejectCallStruct, instance *instance_mode
 
 	err = call.Reject()
 	if err == nil || call.State() == meowcaller.CallPhaseEnded {
-		c.callRegistry.Delete(data.CallID)
+		c.callRegistry.Delete(instance.Id, data.CallID)
 	}
 	if err != nil {
 		logger.LogError("[%s] error reject call: %v", instance.Id, err)
@@ -189,7 +189,7 @@ func (c *callService) HangupCall(data *HangupCallStruct, instance *instance_mode
 
 	err := call.Hangup()
 	if err == nil || call.State() == meowcaller.CallPhaseEnded {
-		c.callRegistry.Delete(data.CallID)
+		c.callRegistry.Delete(instance.Id, data.CallID)
 	}
 	if err != nil {
 		logger.LogError("[%s] error hanging up call: %v", instance.Id, err)
