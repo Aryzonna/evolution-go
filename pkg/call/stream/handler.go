@@ -62,6 +62,11 @@ func serveStream(callService call_service.CallService, instanceService instance_
 		call.Play(b)
 
 		b.writeStart(callID, call.IsVideo())
+		// Outgoing call answered by the peer: tell the consumer over the socket itself, so
+		// it doesn't depend on the instance being subscribed to CALL webhooks (measured in
+		// production: a dial from an unsubscribed instance never learned it was answered).
+		// One-shot; fires immediately if the peer already accepted before this point.
+		call.OnPeerAccept(func() { _ = b.writeJSON(wsMessage{Event: "accepted", CallID: callID}) })
 		b.readLoop() // blocks until the socket closes, from either end
 
 		_ = call.Hangup()

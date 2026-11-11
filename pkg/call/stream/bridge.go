@@ -103,6 +103,7 @@ func (b *bridge) Close() error {
 // (by either side) or send Close(). Every non-media message is ignored rather than
 // erroring, so the wire format can grow new event types without breaking old clients.
 func (b *bridge) readLoop() {
+	var pending []float32
 	for {
 		var msg wsMessage
 		if err := b.conn.ReadJSON(&msg); err != nil {
@@ -140,14 +141,23 @@ func (b *bridge) readLoop() {
 		if err != nil {
 			continue
 		}
-		frame := float32FromPCM16(raw)
-		select {
-		case b.incoming <- frame:
-		case <-b.closed:
-			return
-		default:
-			// Consumer is sending audio faster than the call can play it out; drop
-			// the frame rather than block the socket read loop.
+		// meowcaller's AudioSource contract is exactly FrameSamples (60 ms) per ReadFrame.
+		// Consumers send whatever chunk size they capture (the Flow browser sent 20 ms),
+		// and short frames made the peer's phone sit on "reconnecting" with no audio.
+		// Re-chunk here so any size works.
+		pending = append(pending, float32FromPCM16(raw)...)
+		for len(pending) >= meowcaller.FrameSamples {
+			frame := make([]float32, meowcaller.FrameSamples)
+			copy(frame, pending[:meowcaller.FrameSamples])
+			pending = pending[meowcaller.FrameSamples:]
+			select {
+			case b.incoming <- frame:
+			case <-b.closed:
+				return
+			default:
+				// Consumer is sending audio faster than the call can play it out; drop
+				// the frame rather than block the socket read loop.
+			}
 		}
 	}
 }
