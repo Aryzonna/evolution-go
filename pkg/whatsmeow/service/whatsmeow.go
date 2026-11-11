@@ -54,19 +54,19 @@ import (
 )
 
 /*
-	Recuperações de app state já tentadas, chaveadas por "<instanceID>|<coleção>".
+Recuperações de app state já tentadas, chaveadas por "<instanceID>|<coleção>".
 
-	Enquanto uma coleção está dessincronizada o whatsmeow dispara AppStateSyncError a
-	CADA notificação recebida — foram seis em quatro segundos no caso que motivou isto.
-	Sem a guarda, cada um abriria um full sync novo e um pedido novo ao celular.
+Enquanto uma coleção está dessincronizada o whatsmeow dispara AppStateSyncError a
+CADA notificação recebida — foram seis em quatro segundos no caso que motivou isto.
+Sem a guarda, cada um abriria um full sync novo e um pedido novo ao celular.
 
-	A chave só é liberada depois do COOLDOWN, e não quando a tentativa termina: o
-	segundo degrau da recuperação (a cópia do aparelho principal) é ASSÍNCRONO — o
-	pedido sai, a resposta demora, e os erros continuam pipocando nesse meio-tempo.
-	Liberar ao terminar faria uma tentativa nova a cada erro, justamente enquanto a
-	anterior ainda está a caminho.
+A chave só é liberada depois do COOLDOWN, e não quando a tentativa termina: o
+segundo degrau da recuperação (a cópia do aparelho principal) é ASSÍNCRONO — o
+pedido sai, a resposta demora, e os erros continuam pipocando nesse meio-tempo.
+Liberar ao terminar faria uma tentativa nova a cada erro, justamente enquanto a
+anterior ainda está a caminho.
 
-	Ver o case *events.AppStateSyncError.
+Ver o case *events.AppStateSyncError.
 */
 var appStateRecoveryInFlight sync.Map
 
@@ -132,6 +132,7 @@ type MyClient struct {
 	service            WhatsmeowService
 	WAClient           *whatsmeow.Client
 	eventHandlerID     uint32
+	callGuardHandlerID uint32
 	userID             string
 	Instance           *instance_model.Instance
 	token              string
@@ -215,6 +216,9 @@ func (w whatsmeowService) ReconnectClient(instanceId string) error {
 
 		// Remover event handler se existir
 		if mycli, ok := w.myClientPointer[instanceId]; ok {
+			if mycli.callGuardHandlerID != 0 {
+				client.RemoveEventHandler(mycli.callGuardHandlerID)
+			}
 			if mycli.eventHandlerID != 0 {
 				client.RemoveEventHandler(mycli.eventHandlerID)
 				w.loggerWrapper.GetLogger(instanceId).LogInfo("[%s] Event handler removed", instanceId)
@@ -540,14 +544,13 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 		passkeyCeremony:    w.passkeyCeremony,
 	}
 
-	// Process offers first so automatic rejection prevents meowcaller preaccept.
-	mycli.eventHandlerID = mycli.WAClient.AddEventHandlerWithSuccessStatus(func(evt interface{}) bool {
-		rejectOffer := false
-		if _, ok := evt.(*events.CallOffer); ok {
-			rejectOffer = mycli.Instance.RejectCall
+	// Stop rejected offers before meowcaller can send preaccept.
+	mycli.callGuardHandlerID = mycli.WAClient.AddEventHandlerWithSuccessStatus(func(evt interface{}) bool {
+		if _, ok := evt.(*events.CallOffer); ok && mycli.Instance.RejectCall {
+			mycli.myEventHandler(evt)
+			return false
 		}
-		mycli.myEventHandler(evt)
-		return !rejectOffer
+		return true
 	})
 
 	// meowcaller.NewClient must run before client.Connect() — it installs the raw
@@ -559,6 +562,8 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 		w.loggerWrapper.GetLogger(instanceID).LogInfo("[%s] meowcaller captured incoming call %s from %s", instanceID, call.ID(), call.Peer().String())
 		w.callRegistry.Store(instanceID, call)
 	})
+	// Publish ordinary offers after meowcaller has registered the call.
+	mycli.eventHandlerID = mycli.WAClient.AddEventHandler(mycli.myEventHandler)
 
 	// Armazena o MyClient no map para permitir atualizações posteriores
 	w.myClientPointer[cd.Instance.Id] = mycli
