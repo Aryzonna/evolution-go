@@ -25,6 +25,7 @@ import (
 	_ "github.com/lib/pq"
 	"github.com/patrickmn/go-cache"
 	"github.com/purpshell/meowcaller"
+	"github.com/rs/zerolog"
 	"github.com/skip2/go-qrcode"
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/appstate"
@@ -555,9 +556,15 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 
 	// meowcaller.NewClient must run before client.Connect() — it installs the raw
 	// <call> stanza adapter, and doing so after Connect() is a documented race.
-	meowcallerClient := meowcaller.NewClient(client)
-	w.meowcallerPointer[cd.Instance.Id] = meowcallerClient
 	instanceID := cd.Instance.Id
+	// Sem logger a meowcaller é muda: nem "o áudio do outro lado começou a chegar" nem
+	// "o pacote de áudio não bateu com a chave" aparecem, e uma ligação em que só um lado
+	// ouve fica sem rastro nenhum. Info registra só os marcos de cada ligação (relay
+	// aberto, primeiro áudio em cada sentido, falhas), não um registro por pacote.
+	meowcallerLog := zerolog.New(os.Stdout).Level(zerolog.InfoLevel).With().
+		Timestamp().Str("lib", "meowcaller").Str("instance", instanceID).Logger()
+	meowcallerClient := meowcaller.NewClient(client, meowcaller.WithLogger(meowcallerLog))
+	w.meowcallerPointer[cd.Instance.Id] = meowcallerClient
 	meowcallerClient.OnIncomingCall(func(call *meowcaller.Call) {
 		w.loggerWrapper.GetLogger(instanceID).LogInfo("[%s] meowcaller captured incoming call %s from %s", instanceID, call.ID(), call.Peer().String())
 		w.callRegistry.Store(instanceID, call)

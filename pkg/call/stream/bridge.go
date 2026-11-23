@@ -4,7 +4,10 @@ package call_stream
 import (
 	"encoding/base64"
 	"io"
+	"log"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/purpshell/meowcaller"
@@ -34,11 +37,23 @@ type bridge struct {
 	sendVideo      func([]byte) error
 	startVideo     func() error
 	startVideoOnce sync.Once
+
+	// Contadores para o balanço da ligação, registrado no Close: sem eles, "um lado não
+	// ouve" não diz se o áudio não saiu da meowcaller, não coube no socket ou nunca veio
+	// do consumidor.
+	callID        string
+	inFrames      atomic.Int64 // quadros do celular escritos no socket
+	inWriteErrors atomic.Int64 // quadros do celular que o socket recusou
+	outFrames     atomic.Int64 // quadros do consumidor entregues à meowcaller
+	outDropped    atomic.Int64 // quadros do consumidor descartados com a fila cheia
+	startedAt     time.Time
 }
 
-func newBridge(conn *websocket.Conn) *bridge {
+func newBridge(conn *websocket.Conn, callID string) *bridge {
 	return &bridge{
-		conn: conn,
+		conn:      conn,
+		callID:    callID,
+		startedAt: time.Now(),
 		// ~3 seconds of buffering at one 60ms frame per slot before frames start
 		// getting dropped — enough slack for scheduling jitter without unbounded growth.
 		incoming: make(chan []float32, 50),
@@ -65,7 +80,17 @@ func (b *bridge) writeStart(callID string, video bool) {
 // WriteFrame implements meowcaller.AudioSink: one decoded mono frame from the peer.
 func (b *bridge) WriteFrame(frame []float32) error {
 	payload := base64.StdEncoding.EncodeToString(pcm16FromFloat32(frame))
-	return b.writeJSON(wsMessage{Event: "media", Track: "inbound", Payload: payload})
+	err := b.writeJSON(wsMessage{Event: "media", Track: "inbound", Payload: payload})
+	if err != nil {
+		if b.inWriteErrors.Add(1) == 1 {
+			log.Printf("[call-stream] %s: primeiro quadro do celular recusado pelo socket: %v", b.callID, err)
+		}
+		return err
+	}
+	if b.inFrames.Add(1) == 1 {
+		log.Printf("[call-stream] %s: primeiro quadro do celular enviado ao consumidor (%d amostras)", b.callID, len(frame))
+	}
+	return nil
 }
 
 // WriteVideo implements meowcaller.VideoSink: one Annex-B H.264 access unit.
@@ -92,6 +117,9 @@ func (b *bridge) ReadFrame() ([]float32, error) {
 // to call more than once (from the call's OnEnd callback and from readLoop exiting).
 func (b *bridge) Close() error {
 	b.closeOnce.Do(func() {
+		log.Printf("[call-stream] %s: fim após %s — do celular: %d quadros enviados, %d recusados; do consumidor: %d entregues, %d descartados",
+			b.callID, time.Since(b.startedAt).Round(time.Second),
+			b.inFrames.Load(), b.inWriteErrors.Load(), b.outFrames.Load(), b.outDropped.Load())
 		_ = b.writeJSON(wsMessage{Event: "stop", Reason: "hangup"})
 		close(b.closed)
 		_ = b.conn.Close()
@@ -152,11 +180,13 @@ func (b *bridge) readLoop() {
 			pending = pending[meowcaller.FrameSamples:]
 			select {
 			case b.incoming <- frame:
+				b.outFrames.Add(1)
 			case <-b.closed:
 				return
 			default:
 				// Consumer is sending audio faster than the call can play it out; drop
 				// the frame rather than block the socket read loop.
+				b.outDropped.Add(1)
 			}
 		}
 	}

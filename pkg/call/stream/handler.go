@@ -47,7 +47,7 @@ func serveStream(callService call_service.CallService, instanceService instance_
 			return
 		}
 
-		b := newBridge(conn)
+		b := newBridge(conn, callID)
 		b.sendVideo = call.SendVideo
 		// StartVideo requests an audio->video upgrade. Calling it on a call that
 		// already has video (declared in the original offer) doesn't just no-op --
