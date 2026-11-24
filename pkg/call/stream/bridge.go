@@ -5,7 +5,6 @@ import (
 	"encoding/base64"
 	"io"
 	"log"
-	"math"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -48,32 +47,6 @@ type bridge struct {
 	outFrames     atomic.Int64 // quadros do consumidor entregues à meowcaller
 	outDropped    atomic.Int64 // quadros do consumidor descartados com a fila cheia
 	startedAt     time.Time
-
-	// Volume do que veio do celular: 352 quadros entregues e ninguém ouvindo não diz se
-	// a meowcaller decodificou voz ou silêncio. Medido em 24/11 depois de o balanço de
-	// quadros sair inteiro até o navegador.
-	levelMu    sync.Mutex
-	inAudible  int64   // quadros do celular com RMS acima de audibleRMS
-	inPeakRMS  float64 // maior RMS de um quadro do celular
-	inRMSSum   float64 // soma dos RMS, para a média
-	outAudible int64   // o mesmo para o que o consumidor mandou
-	outPeakRMS float64
-	outRMSSum  float64
-}
-
-// audibleRMS separa fala de silêncio/ruído de fundo num quadro de 60 ms (fala normal
-// fica entre 0,02 e 0,2; silêncio digital é 0).
-const audibleRMS = 0.01
-
-func frameRMS(frame []float32) float64 {
-	if len(frame) == 0 {
-		return 0
-	}
-	var sum float64
-	for _, s := range frame {
-		sum += float64(s) * float64(s)
-	}
-	return math.Sqrt(sum / float64(len(frame)))
 }
 
 func newBridge(conn *websocket.Conn, callID string) *bridge {
@@ -106,22 +79,6 @@ func (b *bridge) writeStart(callID string, video bool) {
 
 // WriteFrame implements meowcaller.AudioSink: one decoded mono frame from the peer.
 func (b *bridge) WriteFrame(frame []float32) error {
-	rms := frameRMS(frame)
-	b.levelMu.Lock()
-	b.inRMSSum += rms
-	if rms > b.inPeakRMS {
-		b.inPeakRMS = rms
-	}
-	firstAudible := false
-	if rms >= audibleRMS {
-		b.inAudible++
-		firstAudible = b.inAudible == 1
-	}
-	b.levelMu.Unlock()
-	if firstAudible {
-		log.Printf("[call-stream] %s: primeiro quadro do celular com som (RMS %.3f)", b.callID, rms)
-	}
-
 	payload := base64.StdEncoding.EncodeToString(pcm16FromFloat32(frame))
 	err := b.writeJSON(wsMessage{Event: "media", Track: "inbound", Payload: payload})
 	if err != nil {
@@ -134,13 +91,6 @@ func (b *bridge) WriteFrame(frame []float32) error {
 		log.Printf("[call-stream] %s: primeiro quadro do celular enviado ao consumidor (%d amostras)", b.callID, len(frame))
 	}
 	return nil
-}
-
-func mean(sum float64, n int64) float64 {
-	if n == 0 {
-		return 0
-	}
-	return sum / float64(n)
 }
 
 // WriteVideo implements meowcaller.VideoSink: one Annex-B H.264 access unit.
@@ -170,12 +120,6 @@ func (b *bridge) Close() error {
 		log.Printf("[call-stream] %s: fim após %s — do celular: %d quadros enviados, %d recusados; do consumidor: %d entregues, %d descartados",
 			b.callID, time.Since(b.startedAt).Round(time.Second),
 			b.inFrames.Load(), b.inWriteErrors.Load(), b.outFrames.Load(), b.outDropped.Load())
-		b.levelMu.Lock()
-		inTotal, outTotal := b.inFrames.Load()+b.inWriteErrors.Load(), b.outFrames.Load()+b.outDropped.Load()
-		log.Printf("[call-stream] %s: volume — do celular: %d de %d quadros com som, média %.4f, pico %.3f; do consumidor: %d de %d com som, média %.4f, pico %.3f",
-			b.callID, b.inAudible, inTotal, mean(b.inRMSSum, inTotal), b.inPeakRMS,
-			b.outAudible, outTotal, mean(b.outRMSSum, outTotal), b.outPeakRMS)
-		b.levelMu.Unlock()
 		_ = b.writeJSON(wsMessage{Event: "stop", Reason: "hangup"})
 		close(b.closed)
 		_ = b.conn.Close()
@@ -234,16 +178,6 @@ func (b *bridge) readLoop() {
 			frame := make([]float32, meowcaller.FrameSamples)
 			copy(frame, pending[:meowcaller.FrameSamples])
 			pending = pending[meowcaller.FrameSamples:]
-			rms := frameRMS(frame)
-			b.levelMu.Lock()
-			b.outRMSSum += rms
-			if rms > b.outPeakRMS {
-				b.outPeakRMS = rms
-			}
-			if rms >= audibleRMS {
-				b.outAudible++
-			}
-			b.levelMu.Unlock()
 			select {
 			case b.incoming <- frame:
 				b.outFrames.Add(1)
