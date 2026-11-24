@@ -48,6 +48,7 @@ type bridge struct {
 	outFrames     atomic.Int64 // quadros do consumidor entregues à meowcaller
 	outDropped    atomic.Int64 // quadros do consumidor descartados com a fila cheia
 	startedAt     time.Time
+	rec           *recorder // nil quando a gravação de diagnóstico não foi pedida
 
 	// Volume do que veio do celular: 352 quadros entregues e ninguém ouvindo não diz se
 	// a meowcaller decodificou voz ou silêncio. Medido em 24/11 depois de o balanço de
@@ -81,6 +82,7 @@ func newBridge(conn *websocket.Conn, callID string) *bridge {
 		conn:      conn,
 		callID:    callID,
 		startedAt: time.Now(),
+		rec:       newRecorder(callID),
 		// ~3 seconds of buffering at one 60ms frame per slot before frames start
 		// getting dropped — enough slack for scheduling jitter without unbounded growth.
 		incoming: make(chan []float32, 50),
@@ -106,6 +108,7 @@ func (b *bridge) writeStart(callID string, video bool) {
 
 // WriteFrame implements meowcaller.AudioSink: one decoded mono frame from the peer.
 func (b *bridge) WriteFrame(frame []float32) error {
+	b.rec.add(frame)
 	rms := frameRMS(frame)
 	b.levelMu.Lock()
 	b.inRMSSum += rms
@@ -176,6 +179,7 @@ func (b *bridge) Close() error {
 			b.callID, b.inAudible, inTotal, mean(b.inRMSSum, inTotal), b.inPeakRMS,
 			b.outAudible, outTotal, mean(b.outRMSSum, outTotal), b.outPeakRMS)
 		b.levelMu.Unlock()
+		b.rec.finish()
 		_ = b.writeJSON(wsMessage{Event: "stop", Reason: "hangup"})
 		close(b.closed)
 		_ = b.conn.Close()
