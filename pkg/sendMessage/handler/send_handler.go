@@ -193,6 +193,11 @@ func (s *sendHandler) SendMedia(ctx *gin.Context) {
 		quoted.MessageID = ctx.PostForm("quoted.messageId")
 		quoted.Participant = ctx.PostForm("quoted.participant")
 
+		// Forma de onda da nota de voz (type=audio), medida por quem gravou: 64 bytes de
+		// 0 a 100 em base64. É o que faz o WhatsApp desenhar as barrinhas em vez de um
+		// traço liso. Ausente, o áudio sai como sempre saiu — ver `resolverWaveform`.
+		waveform := ctx.PostForm("waveform")
+
 		// Get file
 		file, err := ctx.FormFile("file")
 		if err != nil {
@@ -219,6 +224,7 @@ func (s *sendHandler) SendMedia(ctx *gin.Context) {
 			MentionAll:   mentionAll,
 			MentionedJID: mentionedJID,
 			Quoted:       quoted,
+			Waveform:     waveform,
 		}
 
 		// O arquivo vai ABERTO, não lido: vídeo e documento sobem em stream (até 2 GB no

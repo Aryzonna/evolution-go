@@ -120,6 +120,42 @@ type MediaStruct struct {
 	FormatJid       *bool        `json:"formatJid,omitempty"`
 	Quoted          QuotedStruct `json:"quoted"`
 	ForwardingScore *uint32      `json:"forwardingScore,omitempty"`
+	// Waveform: a forma de onda da nota de voz — 64 bytes de 0 a 100 em base64, o mesmo
+	// formato que o campo `waveform` do audioMessage carrega. Só vale para type=audio;
+	// vazio mantém o comportamento de antes (ver `resolverWaveform`).
+	Waveform string `json:"waveform,omitempty"`
+}
+
+/*
+ondaGenerica é a onda FIXA que o envio por URL sempre mandou: o mesmo desenho para todo
+áudio, ali só para o balão não sair liso. Continua como reserva por compatibilidade — quem
+usa /send/media com url e não tem como medir a onda recebe o que sempre recebeu.
+*/
+const ondaGenerica = "OjAnExISDgsKCAkJBwgkHAQEBBEFAwMNAxAcKCgkFzM0QUE4Jh4eKAoKChcLCwkeFgkJCQo3JiQmIiIRPz8/Ow=="
+
+/*
+resolverWaveform decide o que vai no campo `waveform` do audioMessage.
+
+O WhatsApp de quem recebe desenha as barrinhas a partir DESSE campo — 64 bytes, cada um de
+0 a 100. Sem ele a nota de voz chega como um traço liso, que era o caso de TODO áudio
+enviado por multipart: o ramo de arquivo nem preenchia o campo.
+
+`base64Onda` é o que o cliente mediu do próprio arquivo (o Haxys Flow calcula no navegador,
+antes de enviar) — a onda real daquele áudio. Sem ele, cai no `padrao` que o chamador passa:
+a onda genérica no envio por URL e NADA no envio por arquivo, exatamente como era antes
+deste campo existir.
+
+Base64 quebrado não derruba envio: vira o padrão, e o áudio sai.
+*/
+func resolverWaveform(base64Onda string, padrao []byte) []byte {
+	if base64Onda == "" {
+		return padrao
+	}
+	bytesDaOnda, err := base64.StdEncoding.DecodeString(base64Onda)
+	if err != nil || len(bytesDaOnda) == 0 {
+		return padrao
+	}
+	return bytesDaOnda
 }
 
 type PollStruct struct {
@@ -1112,6 +1148,9 @@ func (s *sendService) sendMediaFileWithRetry(data *MediaStruct, fileData []byte,
 			}
 			mediaType = "PtvMessage"
 		case "audio":
+			// `nil` como padrão: sem onda medida pelo cliente, o campo continua ausente —
+			// que é como este ramo (arquivo) sempre saiu.
+			onda := resolverWaveform(data.Waveform, nil)
 			if isNewsletter {
 				media = &waE2E.Message{AudioMessage: &waE2E.AudioMessage{
 					URL:        &uploaded.URL,
@@ -1120,6 +1159,7 @@ func (s *sendService) sendMediaFileWithRetry(data *MediaStruct, fileData []byte,
 					Mimetype:   proto.String(mimeType),
 					FileSHA256: uploaded.FileSHA256,
 					FileLength: &uploaded.FileLength,
+					Waveform:   onda,
 					Seconds:    proto.Uint32(uint32(duration)),
 				}}
 			} else {
@@ -1132,6 +1172,7 @@ func (s *sendService) sendMediaFileWithRetry(data *MediaStruct, fileData []byte,
 					FileEncSHA256: uploaded.FileEncSHA256,
 					FileSHA256:    uploaded.FileSHA256,
 					FileLength:    proto.Uint64(uploaded.FileLength),
+					Waveform:      onda,
 					Seconds:       proto.Uint32(uint32(duration)),
 				}}
 			}
@@ -1587,6 +1628,16 @@ func (s *sendService) sendMediaUrlWithRetry(data *MediaStruct, instance *instanc
 			}
 			mediaType = "PtvMessage"
 		case "audio":
+			/*
+				A onda medida pelo cliente vence a genérica.
+
+				O padrão vai como os BYTES DA STRING base64, sem decodificar — é
+				literalmente o que este ramo mandava antes, e mexer nisso mudaria o
+				desenho que todo mundo que usa /send/media com url já recebe. A onda que
+				vem do cliente, essa sim, é decodificada: ela é base64 de verdade, com os
+				64 valores de 0 a 100 que o WhatsApp espera.
+			*/
+			onda := resolverWaveform(data.Waveform, []byte(ondaGenerica))
 			if isNewsletter {
 				media = &waE2E.Message{AudioMessage: &waE2E.AudioMessage{
 					URL:              &uploaded.URL,
@@ -1596,7 +1647,7 @@ func (s *sendService) sendMediaUrlWithRetry(data *MediaStruct, instance *instanc
 					FileSHA256:       uploaded.FileSHA256,
 					FileLength:       &uploaded.FileLength,
 					StreamingSidecar: []byte(*proto.String("QpmXDsU7YLagdg==")),
-					Waveform:         []byte(*proto.String("OjAnExISDgsKCAkJBwgkHAQEBBEFAwMNAxAcKCgkFzM0QUE4Jh4eKAoKChcLCwkeFgkJCQo3JiQmIiIRPz8/Ow==")),
+					Waveform:         onda,
 					Seconds:          proto.Uint32(uint32(duration)),
 				}}
 			} else {
@@ -1610,7 +1661,7 @@ func (s *sendService) sendMediaUrlWithRetry(data *MediaStruct, instance *instanc
 					FileSHA256:       uploaded.FileSHA256,
 					FileLength:       proto.Uint64(uploaded.FileLength),
 					StreamingSidecar: []byte(*proto.String("QpmXDsU7YLagdg==")),
-					Waveform:         []byte(*proto.String("OjAnExISDgsKCAkJBwgkHAQEBBEFAwMNAxAcKCgkFzM0QUE4Jh4eKAoKChcLCwkeFgkJCQo3JiQmIiIRPz8/Ow==")),
+					Waveform:         onda,
 					Seconds:          proto.Uint32(uint32(duration)),
 				}}
 			}
