@@ -198,6 +198,14 @@ func (s *sendHandler) SendMedia(ctx *gin.Context) {
 		// traço liso. Ausente, o áudio sai como sempre saiu — ver `resolverWaveform`.
 		waveform := ctx.PostForm("waveform")
 
+		// ptt=false manda type=audio como ARQUIVO DE ÁUDIO (ícone de fone, sem onda) em vez
+		// de nota de voz. Ausente, ou qualquer outro valor, segue nota de voz — ver `ehNotaDeVoz`.
+		var ptt *bool
+		if ctx.PostForm("ptt") == "false" {
+			naoEhNotaDeVoz := false
+			ptt = &naoEhNotaDeVoz
+		}
+
 		// Get file
 		file, err := ctx.FormFile("file")
 		if err != nil {
@@ -225,6 +233,7 @@ func (s *sendHandler) SendMedia(ctx *gin.Context) {
 			MentionedJID: mentionedJID,
 			Quoted:       quoted,
 			Waveform:     waveform,
+			Ptt:          ptt,
 		}
 
 		// O arquivo vai ABERTO, não lido: vídeo e documento sobem em stream (até 2 GB no

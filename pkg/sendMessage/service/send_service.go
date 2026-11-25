@@ -124,6 +124,20 @@ type MediaStruct struct {
 	// formato que o campo `waveform` do audioMessage carrega. Só vale para type=audio;
 	// vazio mantém o comportamento de antes (ver `resolverWaveform`).
 	Waveform string `json:"waveform,omitempty"`
+	// Ptt: `false` manda o áudio como ARQUIVO DE ÁUDIO (o "áudio anexado" do WhatsApp,
+	// com o ícone de fone no lugar da foto); ausente ou `true` é nota de voz, como sempre
+	// foi. Ver `ehNotaDeVoz`.
+	Ptt *bool `json:"ptt,omitempty"`
+}
+
+/*
+ehNotaDeVoz diz se o áudio sai como nota de voz (PTT) ou como arquivo de áudio.
+
+O padrão é nota de voz — era a ÚNICA forma antes deste campo, e quem não o manda segue
+recebendo exatamente o mesmo. Só um `ptt=false` explícito vira arquivo de áudio.
+*/
+func ehNotaDeVoz(data *MediaStruct) bool {
+	return data.Ptt == nil || *data.Ptt
 }
 
 /*
@@ -1151,10 +1165,16 @@ func (s *sendService) sendMediaFileWithRetry(data *MediaStruct, fileData []byte,
 			// `nil` como padrão: sem onda medida pelo cliente, o campo continua ausente —
 			// que é como este ramo (arquivo) sempre saiu.
 			onda := resolverWaveform(data.Waveform, nil)
+			// Arquivo de áudio (ptt=false) não leva onda: o WhatsApp o desenha com um
+			// traço liso e o ícone de fone, como o áudio anexado pelo próprio app.
+			notaDeVoz := ehNotaDeVoz(data)
+			if !notaDeVoz {
+				onda = nil
+			}
 			if isNewsletter {
 				media = &waE2E.Message{AudioMessage: &waE2E.AudioMessage{
 					URL:        &uploaded.URL,
-					PTT:        proto.Bool(true),
+					PTT:        proto.Bool(notaDeVoz),
 					DirectPath: &uploaded.DirectPath,
 					Mimetype:   proto.String(mimeType),
 					FileSHA256: uploaded.FileSHA256,
@@ -1165,7 +1185,7 @@ func (s *sendService) sendMediaFileWithRetry(data *MediaStruct, fileData []byte,
 			} else {
 				media = &waE2E.Message{AudioMessage: &waE2E.AudioMessage{
 					URL:           proto.String(uploaded.URL),
-					PTT:           proto.Bool(true),
+					PTT:           proto.Bool(notaDeVoz),
 					DirectPath:    proto.String(uploaded.DirectPath),
 					MediaKey:      uploaded.MediaKey,
 					Mimetype:      proto.String(mimeType),
@@ -1638,10 +1658,15 @@ func (s *sendService) sendMediaUrlWithRetry(data *MediaStruct, instance *instanc
 				64 valores de 0 a 100 que o WhatsApp espera.
 			*/
 			onda := resolverWaveform(data.Waveform, []byte(ondaGenerica))
+			// Arquivo de áudio (ptt=false): sem onda, como o áudio anexado pelo app.
+			notaDeVoz := ehNotaDeVoz(data)
+			if !notaDeVoz {
+				onda = nil
+			}
 			if isNewsletter {
 				media = &waE2E.Message{AudioMessage: &waE2E.AudioMessage{
 					URL:              &uploaded.URL,
-					PTT:              proto.Bool(true),
+					PTT:              proto.Bool(notaDeVoz),
 					DirectPath:       &uploaded.DirectPath,
 					Mimetype:         proto.String(mimeType),
 					FileSHA256:       uploaded.FileSHA256,
@@ -1653,7 +1678,7 @@ func (s *sendService) sendMediaUrlWithRetry(data *MediaStruct, instance *instanc
 			} else {
 				media = &waE2E.Message{AudioMessage: &waE2E.AudioMessage{
 					URL:              proto.String(uploaded.URL),
-					PTT:              proto.Bool(true),
+					PTT:              proto.Bool(notaDeVoz),
 					DirectPath:       proto.String(uploaded.DirectPath),
 					MediaKey:         uploaded.MediaKey,
 					Mimetype:         proto.String(mimeType),
