@@ -63,6 +63,11 @@ type ChatPresenceStruct struct {
 type MarkReadStruct struct {
 	Id     []string `json:"id"`
 	Number string   `json:"number"`
+	// Sender: quem ENVIOU as mensagens lidas. Obrigatório para o recibo valer em GRUPO —
+	// lá o WhatsApp casa o recibo pelo participante, e com o próprio grupo no lugar dele
+	// o recibo é ignorado (a conversa segue "não lida" no celular). Em conversa com
+	// contato, vazio: o remetente é o próprio contato, como sempre foi.
+	Sender string `json:"sender,omitempty"`
 }
 
 type MarkPlayedStruct struct {
@@ -325,7 +330,18 @@ func (m *messageService) MarkRead(data *MarkReadStruct, instance *instance_model
 	// reaches the recipient. Same root cause as the typing fix above.
 	jid = utils.CanonicalJID(jid)
 
-	err = client.MarkRead(context.Background(), data.Id, time.Now(), jid, jid)
+	// Em grupo o remetente é o participante que mandou as mensagens — ver `Sender`.
+	sender := jid
+	if data.Sender != "" {
+		parsed, ok := utils.ParseJID(data.Sender)
+		if !ok {
+			return "", errors.New("invalid sender")
+		}
+		// Sem o aparelho (":13"): o recibo vai para a pessoa, não para um aparelho dela.
+		sender = utils.CanonicalJID(parsed.ToNonAD())
+	}
+
+	err = client.MarkRead(context.Background(), data.Id, time.Now(), jid, sender)
 	if err != nil {
 		m.loggerWrapper.GetLogger(instance.Id).LogError("[%s] error marking message as read: %v", instance.Id, err)
 		return "", errors.New("error marking message as read")
