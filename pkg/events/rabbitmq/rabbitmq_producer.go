@@ -1,6 +1,7 @@
 package rabbitmq_producer
 
 import (
+	"context"
 	"fmt"
 	"net/url"
 	"strings"
@@ -11,6 +12,8 @@ import (
 	"github.com/gomessguii/logger"
 	amqp "github.com/rabbitmq/amqp091-go"
 )
+
+const publishConfirmTimeout = 10 * time.Second
 
 type rabbitMQProducer struct {
 	conn               *amqp.Connection
@@ -123,48 +126,175 @@ func (p *rabbitMQProducer) ensureConnection() error {
 	return nil
 }
 
+func drainCloseError(channel *amqp.Channel, closeChan <-chan *amqp.Error) *amqp.Error {
+	if closeChan == nil {
+		return nil
+	}
+	select {
+	case err, ok := <-closeChan:
+		if ok {
+			return err
+		}
+		return nil
+	default:
+	}
+
+	// If the channel already transitioned to closed, wait briefly in case NotifyClose is still delivering the broker error.
+	if channel != nil && channel.IsClosed() {
+		timer := time.NewTimer(50 * time.Millisecond)
+		defer timer.Stop()
+		select {
+		case err, ok := <-closeChan:
+			if ok {
+				return err
+			}
+		case <-timer.C:
+		}
+	}
+	return nil
+}
+
+func isNonRecoverableAMQPError(closeErr *amqp.Error) bool {
+	if closeErr == nil {
+		return false
+	}
+	return !closeErr.Recover && closeErr.Code >= 400 && closeErr.Code < 500
+}
+
+func (p *rabbitMQProducer) logError(userID, format string, args ...interface{}) {
+	if p.loggerWrapper != nil {
+		p.loggerWrapper.GetLogger(userID).LogError(format, args...)
+		return
+	}
+	logger.LogError(format, args...)
+}
+
+func (p *rabbitMQProducer) openConfirmChannel() (*amqp.Channel, <-chan *amqp.Error, error) {
+	if err := p.ensureConnection(); err != nil {
+		return nil, nil, err
+	}
+
+	ch, err := p.conn.Channel()
+	if err != nil {
+		return nil, nil, fmt.Errorf("falha ao abrir canal: %v", err)
+	}
+
+	if err := ch.Confirm(false); err != nil {
+		_ = ch.Close()
+		return nil, nil, fmt.Errorf("falha ao configurar confirms do canal: %v", err)
+	}
+
+	closeChan := ch.NotifyClose(make(chan *amqp.Error, 1))
+	return ch, closeChan, nil
+}
+
+func (p *rabbitMQProducer) publishOnce(
+	channel *amqp.Channel,
+	closeChan <-chan *amqp.Error,
+	queueName string,
+	payload []byte,
+) (*amqp.Error, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), publishConfirmTimeout)
+	defer cancel()
+
+	confirmation, err := channel.PublishWithDeferredConfirmWithContext(
+		ctx,
+		"",        // exchange
+		queueName, // routing key
+		false,     // mandatory
+		false,     // immediate
+		amqp.Publishing{
+			ContentType:  "application/json",
+			Body:         payload,
+			DeliveryMode: amqp.Persistent, // Garante persistência da mensagem
+		},
+	)
+	if err != nil {
+		closeErr := drainCloseError(channel, closeChan)
+		if closeErr != nil {
+			return closeErr, fmt.Errorf("erro ao publicar (%v); canal fechado pelo broker: %v", err, closeErr)
+		}
+		return nil, err
+	}
+
+	if confirmation == nil {
+		closeErr := drainCloseError(channel, closeChan)
+		if closeErr != nil {
+			return closeErr, fmt.Errorf("confirmação ausente; canal fechado pelo broker: %v", closeErr)
+		}
+		return nil, fmt.Errorf("confirmação de publicação não retornada pelo canal")
+	}
+
+	acked, waitErr := confirmation.WaitContext(ctx)
+	if waitErr != nil {
+		closeErr := drainCloseError(channel, closeChan)
+		if closeErr != nil {
+			return closeErr, fmt.Errorf("erro ao aguardar confirmação (%v); canal fechado pelo broker: %v", waitErr, closeErr)
+		}
+		return nil, fmt.Errorf("timeout/erro ao aguardar confirmação (%s): %w", publishConfirmTimeout, waitErr)
+	}
+
+	if !acked {
+		closeErr := drainCloseError(channel, closeChan)
+		if closeErr != nil {
+			return closeErr, fmt.Errorf("mensagem não confirmada; canal fechado pelo broker: %v", closeErr)
+		}
+		if channel.IsClosed() {
+			return nil, fmt.Errorf("mensagem não confirmada; canal fechado")
+		}
+		return nil, fmt.Errorf("mensagem rejeitada pelo broker (nack)")
+	}
+
+	return nil, nil
+}
+
 func (p *rabbitMQProducer) publishWithRetry(
 	channel *amqp.Channel,
+	closeChan <-chan *amqp.Error,
 	queueName string,
 	payload []byte,
 	userID string,
 ) error {
-	var err error
-	for i := 0; i < p.maxRetries; i++ {
-		err = channel.Publish(
-			"",        // exchange
-			queueName, // routing key
-			false,     // mandatory
-			false,     // immediate
-			amqp.Publishing{
-				ContentType:  "application/json",
-				Body:         payload,
-				DeliveryMode: amqp.Persistent, // Garante persistência da mensagem
-			})
+	var ownedChannels []*amqp.Channel
+	defer func() {
+		for _, ch := range ownedChannels {
+			_ = ch.Close()
+		}
+	}()
 
+	var lastErr error
+	for i := 0; i < p.maxRetries; i++ {
+		closeErr, err := p.publishOnce(channel, closeChan, queueName, payload)
 		if err == nil {
 			return nil
 		}
+		lastErr = err
 
-		logger.LogWarn("[%s] Falha ao publicar mensagem (tentativa %d/%d): %v",
-			userID, i+1, p.maxRetries, err)
+		if isNonRecoverableAMQPError(closeErr) {
+			return err
+		}
 
-		// Se o erro for de conexão, tenta reconectar
-		if err.Error() == "Exception (504) Reason: \"channel/connection is not open\"" {
-			if err := p.ensureConnection(); err != nil {
-				continue
-			}
+		logger.LogWarn("[%s] Falha ao publicar mensagem na fila %s (%d bytes) (tentativa %d/%d): %v",
+			userID, queueName, len(payload), i+1, p.maxRetries, err)
 
-			// Cria novo canal após reconexão
-			channel, err = p.conn.Channel()
-			if err != nil {
-				continue
-			}
+		if i == p.maxRetries-1 {
+			break
 		}
 
 		time.Sleep(time.Second * time.Duration(i+1))
+
+		if channel == nil || channel.IsClosed() || strings.Contains(err.Error(), "channel/connection is not open") {
+			newChannel, newCloseChan, chErr := p.openConfirmChannel()
+			if chErr != nil {
+				lastErr = fmt.Errorf("%v (reabertura do canal falhou: %v)", err, chErr)
+				continue
+			}
+			channel = newChannel
+			closeChan = newCloseChan
+			ownedChannels = append(ownedChannels, newChannel)
+		}
 	}
-	return err
+	return lastErr
 }
 
 func (p *rabbitMQProducer) Produce(
@@ -195,6 +325,8 @@ func (p *rabbitMQProducer) Produce(
 		return fmt.Errorf("falha ao configurar confirms do canal: %v", err)
 	}
 
+	closeChan := channel.NotifyClose(make(chan *amqp.Error, 1))
+
 	args := amqp.Table{
 		"x-queue-type": "quorum",
 		"x-ha-policy":  "all", // Alta disponibilidade
@@ -213,8 +345,10 @@ func (p *rabbitMQProducer) Produce(
 			return fmt.Errorf("falha ao declarar fila %s: %v", queueName, err)
 		}
 
-		err = p.publishWithRetry(channel, queueName, payload, userID)
+		err = p.publishWithRetry(channel, closeChan, queueName, payload, userID)
 		if err != nil {
+			p.logError(userID, "[%s] Erro ao publicar mensagem na fila %s (tamanho: %d bytes): %v",
+				userID, queueName, len(payload), err)
 			return fmt.Errorf("falha ao publicar mensagem após todas as tentativas: %v", err)
 		}
 
