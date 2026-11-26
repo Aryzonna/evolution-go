@@ -148,6 +148,15 @@ usa /send/media com url e não tem como medir a onda recebe o que sempre recebeu
 const ondaGenerica = "OjAnExISDgsKCAkJBwgkHAQEBBEFAwMNAxAcKCgkFzM0QUE4Jh4eKAoKChcLCwkeFgkJCQo3JiQmIiIRPz8/Ow=="
 
 /*
+limiteDeMidiaNoEvento limita o tamanho declarado da mídia que pode ser embutida em base64 no
+evento SendMessage. Como base64 expande em 4/3 e o JSON do evento ainda soma sobrecarga,
+32 MiB fica bem abaixo do limite de 128 MiB (max_message_size) do RabbitMQ: em produção
+(26/11/2026), um vídeo de 163 MB gerou um evento de 217.290.085 bytes que foi recusado
+com precondition_failed e impediu o Flow de receber o eco do envio.
+*/
+const limiteDeMidiaNoEvento = 32 << 20
+
+/*
 resolverWaveform decide o que vai no campo `waveform` do audioMessage.
 
 O WhatsApp de quem recebe desenha as barrinhas a partir DESSE campo — 64 bytes, cada um de
@@ -3148,48 +3157,64 @@ func (s *sendService) SendMessage(instance *instance_model.Instance, msg *waE2E.
 	postMap["data"] = messageData
 
 	if isMedia && s.config.WebhookFiles {
-		var data []byte
-		var err error
-
 		img := msg.GetImageMessage()
 		audio := msg.GetAudioMessage()
 		document := msg.GetDocumentMessage()
 		video := msg.GetVideoMessage()
 		sticker := msg.GetStickerMessage()
 
-		if img != nil {
-			data, err = s.clientPointer[instance.Id].Download(context.Background(), img)
-		} else if audio != nil {
-			data, err = s.clientPointer[instance.Id].Download(context.Background(), audio)
-		} else if document != nil {
-			data, err = s.clientPointer[instance.Id].Download(context.Background(), document)
-		} else if video != nil {
-			data, err = s.clientPointer[instance.Id].Download(context.Background(), video)
-		} else if sticker != nil {
-			data, err = s.clientPointer[instance.Id].Download(context.Background(), sticker)
-
-			webpReader := bytes.NewReader(data)
-			img, err := webp.Decode(webpReader)
-			if err == nil {
-				var pngBuffer bytes.Buffer
-				err = png.Encode(&pngBuffer, img)
-				if err == nil {
-					data = pngBuffer.Bytes()
-				}
-			}
+		var tamanho uint64
+		switch {
+		case img != nil:
+			tamanho = img.GetFileLength()
+		case audio != nil:
+			tamanho = audio.GetFileLength()
+		case document != nil:
+			tamanho = document.GetFileLength()
+		case video != nil:
+			tamanho = video.GetFileLength()
 		}
 
-		if err == nil {
-			// Acessando o Message do map já convertido
-			messageMap := msgMap
-			if messageMap == nil {
-				messageMap = make(map[string]interface{})
+		if tamanho > limiteDeMidiaNoEvento {
+			s.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] SendMessage sem base64: mídia de %d bytes passa do teto do evento (%d)", instance.Id, tamanho, limiteDeMidiaNoEvento)
+		} else {
+			var data []byte
+			var err error
+
+			if img != nil {
+				data, err = s.clientPointer[instance.Id].Download(context.Background(), img)
+			} else if audio != nil {
+				data, err = s.clientPointer[instance.Id].Download(context.Background(), audio)
+			} else if document != nil {
+				data, err = s.clientPointer[instance.Id].Download(context.Background(), document)
+			} else if video != nil {
+				data, err = s.clientPointer[instance.Id].Download(context.Background(), video)
+			} else if sticker != nil {
+				data, err = s.clientPointer[instance.Id].Download(context.Background(), sticker)
+
+				webpReader := bytes.NewReader(data)
+				img, err := webp.Decode(webpReader)
+				if err == nil {
+					var pngBuffer bytes.Buffer
+					err = png.Encode(&pngBuffer, img)
+					if err == nil {
+						data = pngBuffer.Bytes()
+					}
+				}
 			}
 
-			encodeData := base64.StdEncoding.EncodeToString(data)
-			messageMap["base64"] = encodeData
+			if err == nil {
+				// Acessando o Message do map já convertido
+				messageMap := msgMap
+				if messageMap == nil {
+					messageMap = make(map[string]interface{})
+				}
 
-			messageData["Message"] = messageMap
+				encodeData := base64.StdEncoding.EncodeToString(data)
+				messageMap["base64"] = encodeData
+
+				messageData["Message"] = messageMap
+			}
 		}
 	}
 
