@@ -1594,6 +1594,13 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 			video := evt.Message.GetVideoMessage()
 			sticker := evt.Message.GetStickerMessage()
 
+			// Figurinha com som (campo 134) ou Lottie (campo 74): vêm num envelope
+			// que os getters acima não abrem. stickerAudio é o som da primeira.
+			var stickerAudio *waE2E.AudioMessage
+			if sticker == nil {
+				sticker, stickerAudio = stickerFromEnvelopes(evt.Message)
+			}
+
 			// Check for associated child messages (like media in replies)
 			var associatedImg *waE2E.ImageMessage
 			var associatedAudio *waE2E.AudioMessage
@@ -1682,6 +1689,11 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 							mycli.loggerWrapper.GetLogger(mycli.userID).LogWarn("[%s] Failed to decode webp sticker, keeping raw webp: %v", mycli.userID, decErr)
 							extension = ".webp"
 							mimeType = "image/webp"
+							// A Lottie não é webp: guarda com o tipo que ela mesma declara.
+							if mt := sticker.GetMimetype(); mt != "" && mt != "image/webp" {
+								mimeType = mt
+								extension = getExtensionFromMimeType(mt)
+							}
 						} else {
 							var pngBuffer bytes.Buffer
 							if encErr := png.Encode(&pngBuffer, img); encErr != nil {
@@ -1809,6 +1821,26 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 					}
 				} else {
 					mycli.loggerWrapper.GetLogger(mycli.userID).LogWarn("[%s] Skipping media storage due to download failure - ID: %s", mycli.userID, evt.Info.ID)
+				}
+
+				// O som da figurinha com som vira um segundo link (ou base64), ao lado
+				// da imagem: stickerAudioUrl / stickerAudioBase64. Falhar aqui não
+				// derruba a figurinha.
+				if stickerAudio != nil {
+					audioData, audioErr := mycli.WAClient.Download(downloadCtx, stickerAudio)
+					if audioErr != nil || len(audioData) == 0 {
+						mycli.loggerWrapper.GetLogger(mycli.userID).LogWarn("[%s] Failed to download sticker audio - ID: %s, Error: %v", mycli.userID, evt.Info.ID, audioErr)
+					} else if mycli.config.MinioEnabled {
+						audioFileName := buildMediaFileName(mycli.userID, evt.Info.ID+"-audio.ogg")
+						audioURL, storeErr := mycli.mediaStorage.Store(context.Background(), audioData, audioFileName, "audio/ogg")
+						if storeErr != nil {
+							mycli.loggerWrapper.GetLogger(mycli.userID).LogError("[%s] Failed to store sticker audio in S3/Minio - ID: %s, Error: %v", mycli.userID, evt.Info.ID, storeErr)
+						} else {
+							messageMap["stickerAudioUrl"] = audioURL
+						}
+					} else {
+						messageMap["stickerAudioBase64"] = base64.StdEncoding.EncodeToString(audioData)
+					}
 				}
 
 				dataMap["Message"] = messageMap
